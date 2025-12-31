@@ -16,6 +16,7 @@ from textual.widgets import Footer, Label, Static
 from aequify import __version__
 from aequify.core.pubsub import Subscriber
 from aequify.tui.themes import BUILTIN_THEMES
+from aequify.tui.widgets.gpu_info import GPUInfoModal
 from aequify.tui.widgets.response import ConsoleArea
 from aequify.tui.widgets.search_bar import SearchBar
 from aequify.tui.widgets.symbols import SelectedSymbolArea, SymbolBrowser, SymbolData
@@ -388,10 +389,11 @@ class Aequify(App):
     CSS_PATH = CSS_PATH
     BINDINGS = [
         ("q", "quit", "Quit"),
-        ("s", "toggle_engine", "Start/Stop Engine"),
-        ("t", "cycle_theme", "Next Theme"),
-        ("T", "cycle_theme_reverse", "Previous Theme"),
         ("ctrl+f", "focus_search", "Focus Search"),
+        # ("s", "toggle_engine", "Start/Stop Engine"),
+        # ("T", "cycle_theme_reverse", "Previous Theme"),
+        ("ctrl+g", "gpu_info", "GPU Info"),
+        ("t", "cycle_theme", "Cycle Theme"),
     ]
 
     def __init__(
@@ -400,6 +402,7 @@ class Aequify(App):
         pubsub_host: str = "127.0.0.1",
         pubsub_port: int = DEFAULT_PUBSUB_PORT,
         theme: str = DEFAULT_THEME,
+        gpu_info: dict[str, Any] | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -410,6 +413,7 @@ class Aequify(App):
         self._initial_theme = theme
         self._subscriber: Subscriber | None = None
         self._current_theme_index = THEME_NAMES.index(theme) if theme in THEME_NAMES else 0
+        self.gpu_info = gpu_info  # GPU info from Mojo
 
         # Register all built-in themes
         for theme_name, textual_theme in BUILTIN_THEMES.items():
@@ -597,6 +601,10 @@ class Aequify(App):
         except Exception:
             pass
 
+    def action_gpu_info(self) -> None:
+        """Show GPU information modal."""
+        self.push_screen(GPUInfoModal(self.gpu_info))
+
     def on_symbol_tree_symbol_selected(self, event: Any) -> None:
         """Handle symbol selection from browser."""
         try:
@@ -620,6 +628,7 @@ def run_tui(
     pubsub_host: str = "127.0.0.1",
     pubsub_port: int = DEFAULT_PUBSUB_PORT,
     theme: str = DEFAULT_THEME,
+    gpu_info: dict[str, Any] | None = None,
 ) -> None:
     """
     Run the TUI application.
@@ -629,11 +638,13 @@ def run_tui(
         pubsub_host: PubSub server host to connect to.
         pubsub_port: PubSub server port to connect to.
         theme: Initial theme name (default: "galaxy").
+        gpu_info: GPU information dict from Mojo (optional).
     """
     app = Aequify(
         engine=engine,
         pubsub_host=pubsub_host,
         pubsub_port=pubsub_port,
         theme=theme,
+        gpu_info=gpu_info,
     )
     app.run()

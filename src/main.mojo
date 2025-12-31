@@ -67,6 +67,15 @@ fn main() raises:
     var engine_mod = Python.import_module("aequify.engine")
     var tui_mod = Python.import_module("aequify.tui")
 
+    # Get GPU info to pass to TUI
+    var gpu_info = PythonObject(None)
+    if gpu_available():
+        try:
+            var gpu = GPUContext()
+            gpu_info = gpu.to_dict()
+        except:
+            pass
+
     # Create and start engine in background thread
     print("Starting engine...")
     var engine = engine_mod.Engine()
@@ -76,7 +85,7 @@ fn main() raises:
 
     # Run TUI on main thread (blocks until TUI exits)
     print("Starting TUI on main thread...")
-    tui_mod.run_tui(engine)
+    tui_mod.run_tui(engine, gpu_info=gpu_info)
 
     # Cleanup after TUI exits
     print("")
