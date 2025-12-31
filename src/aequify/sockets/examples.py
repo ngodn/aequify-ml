@@ -7,10 +7,11 @@ Run with Python 3.14+:
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from typing import TYPE_CHECKING
+
+from aequify.logging import get_logger
 
 from . import (
     CallbackHandler,
@@ -26,11 +27,7 @@ from . import (
 if TYPE_CHECKING:
     pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(threadName)s] %(levelname)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # =============================================================================
@@ -391,6 +388,10 @@ def example_integration_demo() -> None:
 
 if __name__ == "__main__":
     import sys
+
+    from aequify.logging import setup_logging
+
+    setup_logging()
 
     examples = {
         "echo": ("Echo Server", example_echo_server),

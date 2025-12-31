@@ -6,7 +6,6 @@ Uses explicit locks and thread-safe patterns for robust concurrency.
 
 from __future__ import annotations
 
-import logging
 import socket
 import threading
 from abc import ABC, abstractmethod
@@ -15,6 +14,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING
+
+from aequify.logging import get_logger
 
 from .protocol import (
     Message,
@@ -26,7 +27,7 @@ from .protocol import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class ServerState(Enum):
@@ -336,7 +337,7 @@ class SocketServer:
                     target=self._handle_client,
                     args=(client,),
                     daemon=True,
-                    name=f"{self._thread_name_prefix}--aqsockserver",
+                    name=f"{self._thread_name_prefix}-handler",
                 )
                 thread.start()
 
@@ -390,7 +391,7 @@ class SocketServer:
         self._accept_thread = threading.Thread(
             target=self._accept_loop,
             daemon=True,
-            name=f"{self._thread_name_prefix}--aqsockserver",
+            name=f"{self._thread_name_prefix}-accept",
         )
         self._accept_thread.start()
 

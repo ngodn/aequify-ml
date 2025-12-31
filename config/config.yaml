@@ -129,5 +129,7 @@ rtds:
   order_reconciliation_interval: 90
   symbols: []
 developer:
-  log_level: DEBUG
+  log_level:
+    file: DEBUG
+    tui: INFO
   recvWindow: 15000

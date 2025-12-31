@@ -55,6 +55,7 @@ playground/.questdb/
 playground/.tigerbeetle/
 playground/*.npz
 playground/*.json
+bin/questdb/*
 
 # Logs
 *.log

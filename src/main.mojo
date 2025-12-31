@@ -15,6 +15,22 @@ from aequify import (
 )
 
 
+# =============================================================================
+# Logging
+# =============================================================================
+
+
+fn _get_logger() raises -> PythonObject:
+    """Get the logger for this module."""
+    var logging_mod = Python.import_module("aequify.logging")
+    return logging_mod.get_logger("aequify.main")
+
+
+# =============================================================================
+# Setup
+# =============================================================================
+
+
 fn _setup_python_path() raises:
     """Add src to Python path for imports."""
     var sys = Python.import_module("sys")
@@ -61,10 +77,19 @@ fn print_startup_info() raises:
 fn main() raises:
     """Main entrypoint for the Mojo application."""
     _setup_python_path()
+
+    # Setup logging (before anything else, disable console to avoid TUI interference)
+    var aequify_mod = Python.import_module("aequify")
+    aequify_mod.setup_logging(console_output=PythonObject(False))
+
+    var logger = _get_logger()
+    logger.info("Aequify starting...")
+
     print_startup_info()
 
     # Import Python modules
-    var engine_mod = Python.import_module("aequify.engine")
+    logger.debug("Importing engine and TUI modules")
+    var engine_mod = Python.import_module("aequify.core.engine")
     var tui_mod = Python.import_module("aequify.tui")
 
     # Get GPU info to pass to TUI
@@ -73,23 +98,32 @@ fn main() raises:
         try:
             var gpu = GPUContext()
             gpu_info = gpu.to_dict()
-        except:
-            pass
+            logger.info("GPU context created: " + gpu.device_name())
+        except e:
+            logger.warning("Failed to get GPU info: " + String(e))
 
     # Create and start engine in background thread
     print("Starting engine...")
+    logger.info("Creating and starting engine")
     var engine = engine_mod.Engine()
     engine.start()
+    logger.info("Engine started in background thread")
     print("Engine started in background thread")
     print("")
 
     # Run TUI on main thread (blocks until TUI exits)
     print("Starting TUI on main thread...")
+    logger.info("Starting TUI on main thread")
     tui_mod.run_tui(engine, gpu_info=gpu_info)
 
     # Cleanup after TUI exits
     print("")
     print("TUI exited, shutting down...")
+    logger.info("TUI exited, initiating shutdown")
     engine.stop()
+    logger.debug("Engine stopped")
     shutdown_all(5.0)
+    logger.debug("Runtime shutdown complete")
+    logger.info("Aequify shutdown complete")
+    aequify_mod.shutdown_logging()
     print("Goodbye!")

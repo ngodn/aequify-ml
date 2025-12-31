@@ -11,6 +11,17 @@ from gpu.host import DeviceContext, DeviceStream, DeviceAttribute
 
 
 # =============================================================================
+# Logging
+# =============================================================================
+
+
+fn _get_logger() raises -> PythonObject:
+    """Get the logger for this module."""
+    var logging_mod = Python.import_module("aequify.logging")
+    return logging_mod.get_logger("aequify.core.gpu")
+
+
+# =============================================================================
 # GPU Functions
 # =============================================================================
 
@@ -42,11 +53,16 @@ struct GPUContext:
 
     fn __init__(out self, device_id: Int = 0) raises:
         """Create a GPU context for the specified device."""
+        var logger = _get_logger()
+        logger.debug("Creating GPU context for device " + String(device_id))
         self.ctx = DeviceContext(device_id)
         self.stream = DeviceStream(self.ctx)
+        logger.info("GPU context created: " + self.ctx.name() + " (device " + String(device_id) + ")")
 
     fn synchronize(self) raises:
         """Wait for all GPU operations to complete."""
+        var logger = _get_logger()
+        logger.debug("Synchronizing GPU stream")
         self.stream.synchronize()
 
     # -------------------------------------------------------------------------
@@ -256,15 +272,23 @@ struct GPUContext:
 
 
 fn gpu_available_py(args: PythonObject) raises -> PythonObject:
-    return PythonObject(gpu_available())
+    var logger = _get_logger()
+    var available = gpu_available()
+    logger.debug("gpu_available() called, result: " + String(available))
+    return PythonObject(available)
 
 
 fn device_count_py(args: PythonObject) raises -> PythonObject:
-    return PythonObject(device_count())
+    var logger = _get_logger()
+    var count = device_count()
+    logger.debug("device_count() called, result: " + String(count))
+    return PythonObject(count)
 
 
 fn get_all_info_py(args: PythonObject) raises -> PythonObject:
+    var logger = _get_logger()
     var device_id = Int(args[0]) if len(args) > 0 else 0
+    logger.debug("get_all_info() called for device " + String(device_id))
     var gpu = GPUContext(device_id)
     return gpu.to_dict()
 

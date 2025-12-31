@@ -1,8 +1,5 @@
 """Aequify - ML framework with Python interop."""
 
-# Socket wrappers
-from .core import SocketClient, QueuedClient, SocketServer
-
 # Runtime (async/threading/gpu)
 from .runtime import (
     get_version,
@@ -20,6 +17,3 @@ from .runtime import (
     GPUContext,
     device_count,
 )
-
-# Demo
-from .core import SocketTestResult, run_socket_test

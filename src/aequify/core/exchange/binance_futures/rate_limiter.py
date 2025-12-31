@@ -17,13 +17,14 @@ Headers returned by Binance:
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from aequify.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass

@@ -293,7 +293,7 @@ class IsolatedLoop:
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
-            name=f"aequify-{self.name}",
+            name=f"aeq-{self.name}",
         )
         self._thread.start()
 

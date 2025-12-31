@@ -4,8 +4,13 @@ Aequify PubSub - Topic-based publish/subscribe over sockets.
 Provides real-time message delivery for decoupled components.
 Built on top of aequify.sockets for reliable communication.
 
+Port: Uses PUBSUB_PORT (9300) from aequify.core.ports.
+See aequify/core/ports.py for port allocation rules.
+
 Example Publisher (Engine):
-    server = PubSubServer("127.0.0.1", 9000)
+    from aequify.core.ports import PUBSUB_PORT
+
+    server = PubSubServer("127.0.0.1", PUBSUB_PORT)
     server.start_background()
 
     # Publish state changes
@@ -13,7 +18,9 @@ Example Publisher (Engine):
     server.publish("rate_limit", {"weight": 1200, "limit": 2400})
 
 Example Subscriber (TUI):
-    subscriber = Subscriber("127.0.0.1", 9000, topics=["engine.state"])
+    from aequify.core.ports import PUBSUB_PORT
+
+    subscriber = Subscriber("127.0.0.1", PUBSUB_PORT, topics=["engine.state"])
     subscriber.connect()
 
     # Receive messages
@@ -25,13 +32,14 @@ Example Subscriber (TUI):
 from __future__ import annotations
 
 import json
-import logging
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from aequify.logging import get_logger
+from aequify.core.ports import PUBSUB_PORT
 from aequify.sockets import (
     CallbackHandler,
     ClientConnection,
@@ -41,7 +49,7 @@ from aequify.sockets import (
     SocketServer,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -82,7 +90,9 @@ class PubSubServer:
     - Thread-safe publishing
 
     Example:
-        server = PubSubServer("0.0.0.0", 9000)
+        from aequify.core.ports import PUBSUB_PORT
+
+        server = PubSubServer("0.0.0.0", PUBSUB_PORT)
         server.start_background()
 
         server.publish("engine.state", {"tick": 1, "status": "running"})
@@ -94,7 +104,7 @@ class PubSubServer:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 9000,
+        port: int = PUBSUB_PORT,
         thread_name_prefix: str = "pubsub",
     ) -> None:
         """
@@ -102,7 +112,7 @@ class PubSubServer:
 
         Args:
             host: Host address to bind to.
-            port: Port number to bind to.
+            port: Port number to bind to (default: PUBSUB_PORT from ports.py).
             thread_name_prefix: Prefix for thread names.
         """
         self._host = host
@@ -260,7 +270,9 @@ class Subscriber:
     Connects to a PubSubServer and receives messages filtered by topic.
 
     Example:
-        subscriber = Subscriber("127.0.0.1", 9000)
+        from aequify.core.ports import PUBSUB_PORT
+
+        subscriber = Subscriber("127.0.0.1", PUBSUB_PORT)
         subscriber.connect()
         subscriber.subscribe(["engine.state", "rate_limit"])
 
@@ -273,7 +285,7 @@ class Subscriber:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 9000,
+        port: int = PUBSUB_PORT,
         topics: list[str] | None = None,
         auto_reconnect: bool = True,
     ) -> None:
@@ -282,7 +294,7 @@ class Subscriber:
 
         Args:
             host: Server host address.
-            port: Server port number.
+            port: Server port number (default: PUBSUB_PORT from ports.py).
             topics: Topics to subscribe to (None = all).
             auto_reconnect: Enable automatic reconnection.
         """
@@ -295,7 +307,7 @@ class Subscriber:
             host=host,
             port=port,
             auto_reconnect=auto_reconnect,
-            thread_name_prefix="subscriber",
+            thread_name_prefix="aeq-sub",
         )
 
     @property
@@ -305,13 +317,17 @@ class Subscriber:
 
     def connect(self) -> None:
         """Connect to the pub/sub server."""
+        logger.debug(f"Subscriber connecting to {self._host}:{self._port}...")
         self._client.connect()
+        logger.debug(f"Subscriber connected, is_connected={self._client.is_connected}")
 
         # Send initial subscription
         if self._initial_topics:
-            self.subscribe(self._initial_topics)
+            result = self.subscribe(self._initial_topics)
+            logger.debug(f"Initial subscription sent: {result}")
         else:
-            self._subscribe_all()
+            result = self._subscribe_all()
+            logger.debug(f"Subscribe all sent: {result}")
 
     def disconnect(self) -> None:
         """Disconnect from the server."""
@@ -410,10 +426,12 @@ class SubscriberWorker:
     Useful for integrating with event loops or UI frameworks.
 
     Example:
+        from aequify.core.ports import PUBSUB_PORT
+
         def handle_message(msg: PubSubMessage):
             print(f"{msg.topic}: {msg.data}")
 
-        worker = SubscriberWorker("127.0.0.1", 9000, handler=handle_message)
+        worker = SubscriberWorker("127.0.0.1", PUBSUB_PORT, handler=handle_message)
         worker.start()  # Runs in background thread
 
         # Later
@@ -423,7 +441,7 @@ class SubscriberWorker:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 9000,
+        port: int = PUBSUB_PORT,
         handler: MessageHandler | None = None,
         topics: list[str] | None = None,
     ) -> None:
@@ -432,7 +450,7 @@ class SubscriberWorker:
 
         Args:
             host: Server host address.
-            port: Server port number.
+            port: Server port number (default: PUBSUB_PORT from ports.py).
             handler: Callback for received messages.
             topics: Topics to subscribe to.
         """

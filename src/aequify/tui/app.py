@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import platform
-import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +14,9 @@ from textual.reactive import reactive
 from textual.widgets import Footer, Label, Static
 
 from aequify import __version__
+from aequify.logging import get_logger, setup_tui_logging
+from aequify.core.engine import Engine, get_engine
+from aequify.core.ports import PUBSUB_PORT
 from aequify.core.pubsub import Subscriber
 from aequify.tui.themes import BUILTIN_THEMES
 from aequify.tui.widgets.gpu_info import GPUInfoModal
@@ -21,45 +24,7 @@ from aequify.tui.widgets.response import ConsoleArea
 from aequify.tui.widgets.search_bar import SearchBar
 from aequify.tui.widgets.symbols import SelectedSymbolArea, SymbolBrowser, SymbolData
 
-
-# ============================================================================
-# Mock Engine class for TUI development - TODO: Replace with real engine import
-# ============================================================================
-
-DEFAULT_PUBSUB_PORT = 5555
-
-
-class Engine:
-    """Mock Engine class for TUI development."""
-
-    def __init__(self) -> None:
-        self._running = False
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    def start(self) -> None:
-        self._running = True
-
-    def stop(self) -> None:
-        self._running = False
-
-
-_engine: Engine | None = None
-
-
-def get_engine() -> Engine:
-    """Get global engine instance."""
-    global _engine
-    if _engine is None:
-        _engine = Engine()
-    return _engine
-
-
-# ============================================================================
-# End mock Engine
-# ============================================================================
+logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     pass
@@ -90,18 +55,43 @@ class AppHeader(Horizontal):
     AppHeader #app-title {
         width: 1fr;
     }
+    AppHeader #engine-status {
+        width: auto;
+        padding-right: 2;
+    }
     AppHeader #app-user-host {
         width: auto;
         color: $text-muted;
     }
     """
 
+    # Engine status: "disconnected", "connecting", "running", "error", "stopped"
+    engine_status: reactive[str] = reactive("disconnected")
+
     def compose(self) -> ComposeResult:
         yield Label(f"[b]aequify[/] [dim]{__version__}[/]", id="app-title")
+        yield Label("[yellow]æ[/]", id="engine-status")
         import getpass
         username = getpass.getuser()
         hostname = platform.node()
         yield Label(f"{username}@{hostname}", id="app-user-host")
+
+    def watch_engine_status(self, value: str) -> None:
+        """Update status indicator when engine status changes."""
+        try:
+            status_label = self.query_one("#engine-status", Label)
+            if value == "running":
+                status_label.update("[green]æ[/]")
+            elif value == "connecting":
+                status_label.update("[yellow]æ[/]")
+            elif value == "error":
+                status_label.update("[red]æ[/]")
+            elif value == "stopped":
+                status_label.update("[red dim]æ[/]")
+            else:
+                status_label.update("[yellow dim]æ[/]")
+        except Exception:
+            pass
 
 
 class SystemInfo(Horizontal):
@@ -400,7 +390,7 @@ class Aequify(App):
         self,
         engine: Engine | None = None,
         pubsub_host: str = "127.0.0.1",
-        pubsub_port: int = DEFAULT_PUBSUB_PORT,
+        pubsub_port: int = PUBSUB_PORT,
         theme: str = DEFAULT_THEME,
         gpu_info: dict[str, Any] | None = None,
         *args: Any,
@@ -414,6 +404,7 @@ class Aequify(App):
         self._subscriber: Subscriber | None = None
         self._current_theme_index = THEME_NAMES.index(theme) if theme in THEME_NAMES else 0
         self.gpu_info = gpu_info  # GPU info from Mojo
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="aeq-tui")
 
         # Register all built-in themes
         for theme_name, textual_theme in BUILTIN_THEMES.items():
@@ -443,6 +434,15 @@ class Aequify(App):
         """Initialize app, set theme, load mock data, and start PubSub subscriber."""
         # Set the initial theme
         self.theme = self._initial_theme
+
+        # Setup TUI logging - route logs to console widget
+        def get_console() -> ConsoleArea | None:
+            try:
+                return self.query_one("#console-area", ConsoleArea)
+            except Exception:
+                return None
+
+        setup_tui_logging(get_console)
 
         # Load mock symbol data for development
         self._load_mock_symbols()
@@ -476,6 +476,8 @@ class Aequify(App):
         """Background worker that receives PubSub messages."""
         import asyncio
 
+        logger.info(f"Subscribe loop starting, connecting to {self.pubsub_host}:{self.pubsub_port}")
+
         self._subscriber = Subscriber(
             host=self.pubsub_host,
             port=self.pubsub_port,
@@ -483,22 +485,40 @@ class Aequify(App):
             auto_reconnect=True,
         )
 
+        def update_engine_status(status: str) -> None:
+            try:
+                header = self.query_one(AppHeader)
+                header.engine_status = status
+            except Exception as ex:
+                logger.debug(f"Failed to update engine status: {ex}")
+
         try:
             while True:
                 try:
                     # Try to connect (may fail if engine not started)
                     if not self._subscriber.is_connected:
+                        logger.debug("Not connected, attempting connect...")
                         try:
-                            self._subscriber.connect()
-                        except Exception:
-                            # Update status based on engine state
-                            self._update_engine_status()
+                            update_engine_status("connecting")
+                            # Run blocking connect in thread pool to avoid blocking UI
+                            await asyncio.get_event_loop().run_in_executor(
+                                self._executor, self._subscriber.connect
+                            )
+                            logger.info("PubSub connected!")
+                            update_engine_status("running")
+                        except Exception as e:
+                            logger.warning(f"Connect failed: {type(e).__name__}: {e}")
+                            update_engine_status("error")
                             await asyncio.sleep(1.0)
                             continue
 
                     # Check for messages (non-blocking with short timeout)
-                    msg = self._subscriber.receive(timeout=0.1)
+                    # Run in executor to avoid blocking UI
+                    msg = await asyncio.get_event_loop().run_in_executor(
+                        self._executor, lambda: self._subscriber.receive(timeout=0.1)
+                    )
                     if msg:
+                        # logger.debug(f"Got message: {msg.topic}")
                         if msg.topic == "engine.state":
                             self.post_message(EngineStateUpdate(msg.data))
                         elif msg.topic == "system.stats":
@@ -509,7 +529,9 @@ class Aequify(App):
 
                 except asyncio.CancelledError:
                     raise  # Re-raise to exit the loop
-                except Exception:
+                except Exception as e:
+                    # Log the exception for debugging
+                    logger.error(f"Subscribe loop error: {type(e).__name__}: {e}")
                     # Disconnected - check if engine stopped or just connection lost
                     if self._subscriber:
                         try:
@@ -517,7 +539,7 @@ class Aequify(App):
                         except Exception:
                             pass
 
-                    self._update_engine_status()
+                    update_engine_status("disconnected")
                     await asyncio.sleep(0.5)
         finally:
             # Cleanup on cancellation
@@ -527,22 +549,21 @@ class Aequify(App):
                 except Exception:
                     pass
 
-    def _update_engine_status(self) -> None:
-        """Update engine status in API info bar."""
-        try:
-            api_info = self.query_one("#api-info", APIInfo)
-            if self.engine.is_running:
-                api_info.engine_status = "running"
-            else:
-                api_info.engine_status = "stopped"
-        except Exception:
-            pass
-
     def on_engine_state_update(self, message: EngineStateUpdate) -> None:
         """Handle engine state update from PubSub."""
         try:
-            api_info = self.query_one("#api-info", APIInfo)
-            api_info.engine_status = message.data.get("status", "unknown")
+            # Update engine status in header based on engine state
+            header = self.query_one(AppHeader)
+            status = message.data.get("status", "unknown")
+            if status == "running":
+                header.engine_status = "running"
+            elif status == "error":
+                header.engine_status = "error"
+            elif status in ("stopped", "stopping"):
+                header.engine_status = "stopped"
+            elif status in ("starting",):
+                header.engine_status = "connecting"
+            # Keep current status for unknown states
         except Exception:
             pass
 
@@ -615,6 +636,9 @@ class Aequify(App):
 
     def on_unmount(self) -> None:
         """Cleanup when app closes."""
+        # Shutdown thread pool executor
+        self._executor.shutdown(wait=False)
+
         # Subscriber cleanup is handled by the worker's finally block
         # Stop engine in a thread to avoid blocking
         if self.engine.is_running:
@@ -626,7 +650,7 @@ class Aequify(App):
 def run_tui(
     engine: Engine | None = None,
     pubsub_host: str = "127.0.0.1",
-    pubsub_port: int = DEFAULT_PUBSUB_PORT,
+    pubsub_port: int = PUBSUB_PORT,
     theme: str = DEFAULT_THEME,
     gpu_info: dict[str, Any] | None = None,
 ) -> None:

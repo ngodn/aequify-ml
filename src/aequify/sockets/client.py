@@ -6,7 +6,6 @@ Uses explicit locks and thread-safe patterns for robust concurrency.
 
 from __future__ import annotations
 
-import logging
 import queue
 import socket
 import threading
@@ -14,6 +13,8 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
+
+from aequify.logging import get_logger
 
 from .protocol import (
     Message,
@@ -25,7 +26,7 @@ from .protocol import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class ClientState(Enum):
@@ -203,7 +204,9 @@ class SocketClient:
 
         try:
             self._socket = self._create_socket()
+            logger.debug(f"Attempting socket.connect to {self._host}:{self._port}...")
             self._socket.connect((self._host, self._port))
+            logger.debug(f"Socket connected to {self._host}:{self._port}")
 
             # Set receive timeout after connection
             if self._recv_timeout is not None:
@@ -220,7 +223,7 @@ class SocketClient:
                 self._recv_thread = threading.Thread(
                     target=self._receive_loop,
                     daemon=True,
-                    name=f"{self._thread_name_prefix}--aqsockclient",
+                    name=f"{self._thread_name_prefix}-recv",
                 )
                 self._recv_thread.start()
                 self._handler.on_connect()
@@ -376,6 +379,7 @@ class SocketClient:
 
     def _receive_loop(self) -> None:
         """Background receive loop for async handler pattern."""
+        logger.debug(f"Receiver thread started for {self._host}:{self._port}")
         reconnect_attempts = 0
 
         while not self._shutdown_event.is_set():
@@ -383,6 +387,7 @@ class SocketClient:
                 with self._socket_lock:
                     sock = self._socket
                     if sock is None:
+                        logger.debug("Receiver loop: socket is None, exiting")
                         break
 
                     try:
@@ -397,7 +402,7 @@ class SocketClient:
 
                 if not data:
                     # Server disconnected
-                    logger.info("Server disconnected")
+                    logger.info(f"Server {self._host}:{self._port} disconnected (empty recv)")
                     break
 
                 self._buffer.append(data)
@@ -422,10 +427,13 @@ class SocketClient:
                 break
 
         # Handle disconnection
+        logger.debug(f"Receiver loop ended for {self._host}:{self._port}, shutdown={self._shutdown_event.is_set()}")
         if not self._shutdown_event.is_set():
             if self._auto_reconnect:
+                logger.debug("Starting auto-reconnect...")
                 self._attempt_reconnect(reconnect_attempts)
             else:
+                logger.debug("No auto-reconnect, cleaning up")
                 self._cleanup()
                 if self._handler:
                     self._handler.on_disconnect()

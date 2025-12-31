@@ -10,6 +10,22 @@ from python import Python, PythonObject
 from .core.gpu import gpu_available, GPUContext, device_count
 
 
+# =============================================================================
+# Logging
+# =============================================================================
+
+
+fn _get_logger() raises -> PythonObject:
+    """Get the logger for this module."""
+    var logging_mod = Python.import_module("aequify.logging")
+    return logging_mod.get_logger("aequify.runtime")
+
+
+# =============================================================================
+# Internal Helpers
+# =============================================================================
+
+
 fn _get_runtime_module() raises -> PythonObject:
     """Load the aequify.runtime Python module."""
     var sys = Python.import_module("sys")
@@ -49,8 +65,14 @@ fn setup_uvloop() raises -> Bool:
     Returns:
         True if uvloop was set up, False if not available.
     """
+    var logger = _get_logger()
     var runtime = _get_runtime_module()
-    return Bool(runtime.setup_uvloop())
+    var result = Bool(runtime.setup_uvloop())
+    if result:
+        logger.debug("uvloop installed as default event loop policy")
+    else:
+        logger.debug("uvloop not available, using default asyncio")
+    return result
 
 
 fn is_uvloop_available() raises -> Bool:
@@ -84,8 +106,11 @@ fn shutdown_main_loop(timeout: Float64 = 5.0) raises:
     Args:
         timeout: Maximum time to wait for shutdown.
     """
+    var logger = _get_logger()
+    logger.debug("Shutting down main event loop (timeout=" + String(timeout) + "s)")
     var runtime = _get_runtime_module()
     runtime.shutdown_main_loop(PythonObject(timeout))
+    logger.debug("Main event loop shutdown complete")
 
 
 # =============================================================================
@@ -186,10 +211,15 @@ struct IsolatedLoop:
         self.name = name
         var runtime = _get_runtime_module()
         self._py_loop = runtime.IsolatedLoop(PythonObject(name))
+        var logger = _get_logger()
+        logger.debug("IsolatedLoop created: " + name)
 
     fn start(mut self) raises:
         """Start the isolated event loop in a background thread."""
+        var logger = _get_logger()
+        logger.debug("IsolatedLoop starting: " + self.name)
         self._py_loop.start()
+        logger.info("IsolatedLoop started: " + self.name)
 
     fn stop(mut self, timeout: Float64 = 5.0) raises:
         """
@@ -198,7 +228,10 @@ struct IsolatedLoop:
         Args:
             timeout: Maximum time to wait for shutdown.
         """
+        var logger = _get_logger()
+        logger.debug("IsolatedLoop stopping: " + self.name + " (timeout=" + String(timeout) + "s)")
         self._py_loop.stop(PythonObject(timeout))
+        logger.info("IsolatedLoop stopped: " + self.name)
 
     fn is_running(self) raises -> Bool:
         """Check if the loop is running."""
@@ -242,5 +275,8 @@ fn shutdown_all(timeout: Float64 = 5.0) raises:
     Args:
         timeout: Maximum time to wait for each resource.
     """
+    var logger = _get_logger()
+    logger.info("Shutting down all runtime resources (timeout=" + String(timeout) + "s)")
     var runtime = _get_runtime_module()
     runtime.shutdown_all(PythonObject(timeout))
+    logger.info("All runtime resources shutdown complete")
