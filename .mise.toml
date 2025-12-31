@@ -11,6 +11,7 @@ _.python.venv = { path = ".venv", create = true, uv_create_args = ["--seed"] }
 python = "3.14.2"
 uv = "latest"
 ruff = "latest"
+"java" = { version = "openjdk-17"}
 
 [settings]
 python.uv_venv_auto = true
@@ -21,15 +22,26 @@ run = "rm -rf .venv"
 
 [tasks.install]
 description = "Install project dependencies"
+depends = ["questdb:setup"]
 run = "uv sync"
 
 [tasks.dev]
 description = "Install with dev dependencies"
+depends = ["questdb:setup"]
 run = "uv sync --all-extras"
 
 [tasks.aequify]
 description = "Run Aequify TUI"
-run = "uv run mojo -I src src/main.mojo"
+run = """
+#!/usr/bin/env bash
+# Ensure QuestDB is running
+if ! ./helper/questdb.sh status 2>&1 | grep -q "RUNNING"; then
+    echo "Starting QuestDB..."
+    ./helper/questdb.sh start
+    sleep 2
+fi
+uv run mojo -I src src/main.mojo
+"""
 
 [tasks.lint]
 description = "Run linter"
@@ -51,6 +63,39 @@ run = "uv run mypy src/"
 description = "Clean build artifacts"
 run = "rm -rf .venv dist build *.egg-info .pytest_cache .mypy_cache .ruff_cache"
 
+[tasks.cleancache]
+description = "Clean __pycache__ and __mojocache__ directories"
+run = "find . -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null; find . -type d -name '__mojocache__' -exec rm -rf {} + 2>/dev/null; echo 'Cache cleaned'"
+
 [tasks.watch]
 description = "Run Aequify with auto-restart on file changes"
 run = "uv run watchfiles 'python -m aequify' src/"
+
+# QuestDB tasks
+[tasks.questdb]
+description = "Show QuestDB helper usage"
+run = "./helper/questdb.sh"
+
+[tasks."questdb:setup"]
+description = "Download and install QuestDB binaries"
+run = "./helper/questdb.sh setup"
+
+[tasks."questdb:start"]
+description = "Start QuestDB server"
+run = "./helper/questdb.sh start"
+
+[tasks."questdb:stop"]
+description = "Stop QuestDB server"
+run = "./helper/questdb.sh stop"
+
+[tasks."questdb:restart"]
+description = "Restart QuestDB server"
+run = "./helper/questdb.sh restart"
+
+[tasks."questdb:status"]
+description = "Show QuestDB status"
+run = "./helper/questdb.sh status"
+
+[tasks."questdb:logs"]
+description = "Tail QuestDB logs"
+run = "./helper/questdb.sh logs"
