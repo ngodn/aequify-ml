@@ -8,11 +8,12 @@ via PubSub for real-time TUI updates.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from aequify.logging import get_logger
+from aequify.core.ports import PUBSUB_PORT
 from aequify.core.pubsub import PubSubServer
 from aequify.core.system import SystemMonitor
 from aequify.runtime import IsolatedLoop
@@ -20,10 +21,7 @@ from aequify.runtime import IsolatedLoop
 if TYPE_CHECKING:
     from collections.abc import Coroutine
 
-logger = logging.getLogger(__name__)
-
-# Default PubSub port
-DEFAULT_PUBSUB_PORT = 9100
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -77,7 +75,7 @@ class Engine:
         tick_interval: float = 1.0,
         system_stats_interval: float = 2.0,
         pubsub_host: str = "127.0.0.1",
-        pubsub_port: int = DEFAULT_PUBSUB_PORT,
+        pubsub_port: int = PUBSUB_PORT,
     ) -> None:
         """
         Initialize the engine.
@@ -166,7 +164,7 @@ class Engine:
         self._pubsub = PubSubServer(
             host=self.pubsub_host,
             port=self.pubsub_port,
-            thread_name_prefix="engine-pubsub",
+            thread_name_prefix="aeq-pubsub",
         )
         self._pubsub.start_background()
         logger.info(f"Engine PubSub server started on {self.pubsub_host}:{self.pubsub_port}")
