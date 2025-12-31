@@ -1,0 +1,133 @@
+trading:
+  enabled: true
+  mode: demo
+  disable_trading_on_window_utc:
+    - - 2320
+      - 2321
+  risk:
+    max_positions: 20
+    max_daily_loss_pct: 5.0
+  futures:
+    margin_mode: CROSS
+    leverage: 10
+    long:
+      enabled: true
+      initial_entry_size_usdt: 6.25
+      maximum_position_size_usdt: 180.0
+    short:
+      enabled: true
+      initial_entry_size_usdt: 6.25
+      maximum_position_size_usdt: 180.0
+filters:
+  - name: absolute_price_percentage_change
+    enabled: true
+    config:
+      top: 20
+  - name: symbol_filter
+    enabled: true
+    config:
+      pair: USDT
+      blacklist:
+        - 币安人生 # Chinese chars - causes encoding issues
+        - BAS
+        - ETH
+        - FIS
+        - MILK
+        - TOKEN
+      whitelist: []
+engines:
+  apex:
+    processing: GPU
+    min_warm_duration_hours: 4.0
+    max_warm_age_hours: 2016.0
+    max_cache_valid_days: 7.0 # If cache < 7 days old, skip backfill + GPU entirely
+    min_entries_for_validity: 5
+    # Volume imbalance: price-based (footprint/order flow style)
+    # Measures buy/sell imbalance at trades within X% of current price
+    imbalance_price_tolerance_pct: 1.0  # 1% price range for imbalance calculation
+    bootstrap:
+      max_trades: 10000000
+      # Lookback windows for rolling high/low price detection
+      lookback_windows_ms:
+        - 900000 # 15 minutes
+        - 1800000 # 30 minutes
+        - 2700000 # 45 minutes
+        - 3600000 # 1 hour
+        - 14400000 # 4 hours
+      # Position exit parameters
+      position:
+        target_profit_pct:
+          min: 1.75
+          max: 3.75
+          step: 1.0
+          default: 1.5
+        stop_loss_pct:
+          min: -3.0
+          max: -1.0
+          step: 1.0
+          default: -1.0
+        max_hold_time_ms:
+          min: 900000
+          max: 3600000
+          step: 900000
+          default: 60000
+      # LONG signal: Price DROPS + SELLING pressure -> BUY expecting bounce
+      long:
+        signal_offset: 0.25
+        price_move_pct: # How much price must DROP from rolling high
+          min: -10.75
+          max: -2.75
+          step: 2.0
+          default: -3.5
+        volume_delta_threshold: # Selling pressure (negative = more sells)
+          min: -90
+          max: -60
+          step: 10
+          default: -50
+        dca_distance_pct:
+          min: -10.75
+          max: -2.75
+          step: 2.0
+          default: -3.5
+      # SHORT signal: Price RISES + BUYING pressure -> SELL expecting drop
+      short:
+        signal_offset: 0.25
+        price_move_pct: # How much price must RISE from rolling low
+          min: 10.0
+          max: 40.0
+          step: 10.0
+          default: 7.0
+        volume_delta_threshold: # Buying pressure (positive = more buys)
+          min: 60
+          max: 90
+          step: 10
+          default: 50
+        dca_distance_pct:
+          min: 10.0
+          max: 40.0
+          step: 10.0
+          default: 7.0
+
+database:
+  hot:
+    duration_days: 30
+    trades_per_second: 60
+    safety_margin: 1.1
+  warm:
+    enabled: true
+    host: localhost
+    port: 9000
+    table: trades
+  flush:
+    interval_seconds: 60
+    min_trades: 100
+rtds:
+  exchange: binanceusdm
+  demo: false
+  max_retries: 0
+  position_poll_delay: 60
+  order_reconciliation_interval: 90
+  symbols: []
+developer:
+  log_level: DEBUG
+  recvWindow: 15000

@@ -1,0 +1,1261 @@
+"""
+APEX Chart Pane widget.
+
+Displays real-time APEX analysis visualization for the selected symbol:
+- Optimized parameters from GPU bootstrap (with TP/SL, win rate, entries)
+- Session Levels for dynamic TP/DCA zones
+- Volume Imbalance bar with LONG/SHORT trigger zones (price-based, footprint style)
+- Price Movement from High/Low combined view
+- Signal readiness checklist
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+from rich.console import Group
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from textual.app import ComposeResult
+from textual.containers import VerticalScroll
+from textual.reactive import reactive
+from textual.widgets import Static
+
+from aequify.tui.widgets.theme_colors import ThemeColorsMixin
+
+
+# ============================================================================
+# Mock classes for TUI development - TODO: Replace with real engine imports
+# ============================================================================
+
+
+@dataclass
+class OptimizedParams:
+    """Mock optimized parameters from bootstrap."""
+
+    price_move: float = -2.5
+    time_window: int = 30000
+    delta_threshold: float = -50.0
+    dca_distance_pct: float = -3.0
+    target_profit: float = 1.5
+    stop_loss: float = 5.0
+    max_hold_time_ms: int = 3600000
+    win_rate: float = 0.65
+    entries: int = 150
+    avg_pnl: float = 0.8
+
+
+class LevelType(Enum):
+    """Session level type."""
+
+    POC = "POC"
+    IMBALANCE = "IMB"
+    VAH = "VAH"
+    VAL = "VAL"
+
+
+@dataclass
+class SessionLevel:
+    """Mock session level for TP/DCA zones."""
+
+    price: float
+    level_type: LevelType
+    session: str
+    is_unfilled: bool = True
+
+    def distance_from_price(self, current_price: float) -> float:
+        if current_price == 0:
+            return 0.0
+        return ((self.price - current_price) / current_price) * 100
+
+
+@dataclass
+class SessionLevelCache:
+    """Mock session level cache."""
+
+    levels: list[SessionLevel] = field(default_factory=list)
+    tp_levels_long: list[SessionLevel] = field(default_factory=list)
+    tp_levels_short: list[SessionLevel] = field(default_factory=list)
+    dca_levels_long: list[SessionLevel] = field(default_factory=list)
+    dca_levels_short: list[SessionLevel] = field(default_factory=list)
+
+    @classmethod
+    def mock(cls, current_price: float = 100.0) -> "SessionLevelCache":
+        """Create mock session levels for testing."""
+        levels = [
+            SessionLevel(current_price * 1.02, LevelType.POC, "Asia"),
+            SessionLevel(current_price * 1.035, LevelType.VAH, "London"),
+            SessionLevel(current_price * 0.98, LevelType.VAL, "Asia"),
+            SessionLevel(current_price * 0.965, LevelType.IMBALANCE, "NY"),
+        ]
+        return cls(
+            levels=levels,
+            tp_levels_long=[l for l in levels if l.price > current_price],
+            tp_levels_short=[l for l in levels if l.price < current_price],
+            dca_levels_long=[l for l in levels if l.price < current_price],
+            dca_levels_short=[l for l in levels if l.price > current_price],
+        )
+
+
+@dataclass
+class APEXTUIState:
+    """Mock APEX TUI state for development."""
+
+    # Bootstrap state
+    is_bootstrapped: bool = True
+    source: str = "cached"
+    long_params: OptimizedParams | None = None
+    short_params: OptimizedParams | None = None
+
+    # Backfill progress
+    backfill_status: str = ""
+    backfill_progress: float = 0.0
+    backfill_current_day: int = 0
+    backfill_total_days: int = 0
+
+    # Price data
+    current_price: float = 100.0
+    rolling_high: float = 102.0
+    rolling_low: float = 98.0
+    price_move_from_high: float = -1.96
+    price_move_from_low: float = 2.04
+    price_window: int = 30000
+
+    # Volume delta
+    long_volume_delta: float = -35.0
+    short_volume_delta: float = 25.0
+    imbalance_price_pct: float = 0.1
+
+    # Signal state
+    long_signal_ready: bool = False
+    short_signal_ready: bool = False
+    long_signal_offset: float = 0.0
+    short_signal_offset: float = 0.0
+
+    # Position state
+    has_long_position: bool = False
+    has_short_position: bool = False
+    long_position_size: float = 0.0
+    short_position_size: float = 0.0
+    long_position_entry: float = 0.0
+    short_position_entry: float = 0.0
+    long_price_from_entry: float = 0.0
+    short_price_from_entry: float = 0.0
+    long_max_position_size: float = 1000.0
+    short_max_position_size: float = 1000.0
+
+    # Trade count
+    trade_count: int = 0
+
+    def long_trigger_threshold(self) -> float:
+        base = self.long_params.price_move if self.long_params else -2.0
+        return base + self.long_signal_offset
+
+    def short_trigger_threshold(self) -> float:
+        base = self.short_params.price_move if self.short_params else 2.0
+        return base - self.short_signal_offset
+
+    @classmethod
+    def mock(cls) -> "APEXTUIState":
+        """Create mock state with sample data."""
+        return cls(
+            is_bootstrapped=True,
+            source="cached",
+            long_params=OptimizedParams(
+                price_move=-2.5,
+                delta_threshold=-50.0,
+                target_profit=1.5,
+                stop_loss=5.0,
+                win_rate=0.65,
+                entries=150,
+                avg_pnl=0.8,
+            ),
+            short_params=OptimizedParams(
+                price_move=2.5,
+                delta_threshold=50.0,
+                target_profit=1.5,
+                stop_loss=5.0,
+                win_rate=0.62,
+                entries=140,
+                avg_pnl=0.7,
+            ),
+            current_price=100.0,
+            rolling_high=102.0,
+            rolling_low=98.0,
+            price_move_from_high=-1.96,
+            price_move_from_low=2.04,
+            long_volume_delta=-35.0,
+            short_volume_delta=25.0,
+            trade_count=1250,
+        )
+
+
+# ============================================================================
+# End mock classes
+# ============================================================================
+
+
+class APEXChartPane(VerticalScroll, ThemeColorsMixin):
+    """
+    Pane displaying real-time APEX analysis visualization.
+
+    Shows:
+    - Optimized parameters from GPU bootstrap (TP, SL, win rate, entries)
+    - Session Levels (unfilled POC/imbalance levels for TP/DCA)
+    - Volume Imbalance with LONG/SHORT zones (price-based, footprint style)
+    - Price Movement combined view
+    - Signal readiness checklist
+    """
+
+    DEFAULT_CSS = """
+    APEXChartPane {
+        padding: 0 1;
+        background: transparent;
+        scrollbar-gutter: stable;
+    }
+
+    APEXChartPane #apex-no-data {
+        color: $text-muted;
+        text-style: italic;
+        padding: 1;
+        hatch: right $surface-lighten-1 70%;
+    }
+
+    APEXChartPane #apex-status {
+        dock: top;
+        height: auto;
+        padding: 0 0 1 0;
+        color: $text;
+    }
+
+    APEXChartPane #apex-content {
+        height: auto;
+    }
+    """
+
+    # Reactive state
+    is_active: reactive[bool] = reactive(False)
+    trade_count: reactive[int] = reactive(0)
+
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        id: str | None = None,
+        classes: str | None = None,
+        disabled: bool = False,
+    ) -> None:
+        super().__init__(name=name, id=id, classes=classes, disabled=disabled)
+        self._state: APEXTUIState | None = None
+        self._session_levels: SessionLevelCache | None = None
+        self._selected_symbol: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="apex-status")
+        yield Static(
+            "Waiting for trade data...",
+            id="apex-no-data",
+        )
+        yield Static("", id="apex-content")
+
+    def on_mount(self) -> None:
+        self._update_status()
+
+    def watch_is_active(self, active: bool) -> None:
+        """Update status when active state changes."""
+        self._update_status()
+
+    def watch_trade_count(self, count: int) -> None:
+        """Update display when trade count changes."""
+        self._update_status()
+        self._update_content()
+
+    def _update_status(self) -> None:
+        """Update the status line."""
+        status = self.query_one("#apex-status", Static)
+        status_text = Text()
+
+        muted = self.muted_style
+        accent = self.accent_color
+        secondary = self.secondary_color
+
+        if self.is_active:
+            status_text.append("● LIVE", style=self.bold_success_style)
+        else:
+            status_text.append("○ IDLE", style=self.bold_warning_style)
+
+        status_text.append(f"  [{self.trade_count} trades]", style=muted)
+
+        if self._selected_symbol:
+            base = (
+                self._selected_symbol.split("/")[0]
+                if "/" in self._selected_symbol
+                else self._selected_symbol
+            )
+            status_text.append(f"  {base}", style=muted)
+
+        # Show bootstrap source
+        if self._state and self._state.is_bootstrapped:
+            source = self._state.source
+            if source == "cached":
+                status_text.append("  [cached]", style=accent)
+            elif source == "gpu":
+                status_text.append("  [gpu]", style=secondary)
+
+        status.update(status_text)
+
+    def _update_content(self) -> None:
+        """Update the main content display."""
+        no_data = self.query_one("#apex-no-data", Static)
+        content = self.query_one("#apex-content", Static)
+
+        if self._state is None or self._state.trade_count == 0:
+            no_data.display = True
+            content.display = False
+            return
+
+        no_data.display = False
+        content.display = True
+
+        content.update(self._build_display())
+
+    def _build_display(self) -> Group:
+        """Build the rich display for APEX analysis."""
+        if self._state is None:
+            return Group()
+
+        state = self._state
+
+        # Build sections
+        sections = []
+
+        # 1. Optimized Parameters Section (Bootstrap Params)
+        sections.append(self._build_optimized_params_section(state))
+        sections.append(Text())  # Spacer
+
+        # 2. Session Levels Section (TP/DCA zones from continuous learning)
+        sections.append(self._build_session_levels_section())
+        sections.append(Text())  # Spacer
+
+        # 3. Volume Delta Section
+        sections.append(self._build_delta_section(state))
+        sections.append(Text())  # Spacer
+
+        # 4. Price Movement Section (combined LONG/SHORT)
+        sections.append(self._build_price_movement_section(state))
+        sections.append(Text())  # Spacer
+
+        # 5. Signal Readiness (checklist format)
+        sections.append(self._build_signal_readiness(state))
+
+        return Group(*sections)
+
+    def _get_theme_colors_dict(self) -> dict[str, str]:
+        """Get all theme colors as a dict for use in Rich Text."""
+        return {
+            "success": self.success_color,
+            "error": self.error_color,
+            "warning": self.warning_color,
+            "accent": self.accent_color,
+            "primary": self.primary_color,
+            "secondary": self.secondary_color,
+            "muted": self.muted_style,
+        }
+
+    def _format_max_hold(self, ms: int) -> str:
+        """Format max hold time in human readable format."""
+        if ms >= 3600000:
+            return f"{ms // 3600000}hr"
+        elif ms >= 60000:
+            return f"{ms // 60000}min"
+        elif ms >= 1000:
+            return f"{ms // 1000}s"
+        else:
+            return f"{ms}ms"
+
+    def _build_optimized_params_section(self, state: APEXTUIState) -> Panel:
+        """Build optimized parameters display showing LONG and SHORT side by side."""
+        colors = self._get_theme_colors_dict()
+        success = colors["success"]
+        error = colors["error"]
+        warning = colors["warning"]
+        accent = colors["accent"]
+        secondary = colors["secondary"]
+        muted = colors["muted"]
+
+        if not state.is_bootstrapped:
+            # Check if backfill is in progress
+            if state.backfill_status:
+                content = Text()
+                content.append("Backfilling historical data...\n\n", style=f"bold {warning}")
+                content.append(f"  {state.backfill_status}\n\n", style=accent)
+
+                # Progress bar
+                progress_width = 40
+                filled = int((state.backfill_progress / 100) * progress_width)
+                content.append("  [", style=muted)
+                content.append("█" * filled, style=accent)
+                content.append("░" * (progress_width - filled), style=muted)
+                content.append("]", style=muted)
+                content.append(
+                    f" {state.backfill_progress}% ({state.backfill_current_day}/{state.backfill_total_days} days)\n",
+                    style=muted,
+                )
+
+                return Panel(content, title="Bootstrap Parameters", border_style=warning)
+
+            not_ready = Text(
+                "APEX not bootstrapped - waiting for initialization...", style=f"{muted} italic"
+            )
+            return Panel(not_ready, title="Bootstrap Parameters", border_style=muted)
+
+        # Create side-by-side table for LONG and SHORT
+        table = Table.grid(padding=(0, 2))
+        table.add_column(width=32)  # LONG column
+        table.add_column(width=2)  # Separator
+        table.add_column(width=32)  # SHORT column
+
+        # Build LONG column
+        long_text = Text()
+        if state.long_params:
+            lp = state.long_params
+            max_hold_display = self._format_max_hold(lp.max_hold_time_ms)
+            is_default = lp.entries == 0  # entries=0 means using config defaults
+
+            long_text.append("LONG", style=f"bold {error} underline")
+            if is_default:
+                long_text.append(" [DEFAULT]", style=warning)
+            long_text.append("\n")
+            long_text.append(f"  Price Move:    {lp.price_move:+.1f}%\n", style="")
+            long_text.append(f"  Time Window:   {lp.time_window}ms\n", style="")
+            long_text.append(f"  Delta Thresh:  {lp.delta_threshold:+.0f}%\n", style="")
+            long_text.append(f"  Min DCA Dist:  {lp.dca_distance_pct:+.1f}%\n", style=secondary)
+            long_text.append(f"  Fallback TP:   {lp.target_profit:.1f}%\n", style=success)
+            long_text.append(f"  Stop Loss:     {lp.stop_loss:.1f}%\n", style=error)
+            long_text.append(f"  Max Hold:      {max_hold_display}\n", style=warning)
+            long_text.append("  ───────────────────\n", style=muted)
+            long_text.append(f"  Win Rate:      {lp.win_rate * 100:.1f}%\n", style="bold")
+            long_text.append(f"  Entries:       {lp.entries}\n", style=muted)
+            long_text.append(
+                f"  Avg PnL:       {lp.avg_pnl:+.2f}%\n",
+                style=success if lp.avg_pnl >= 0 else error,
+            )
+        else:
+            long_text.append("LONG\n", style=f"bold {error} underline")
+            long_text.append("  Not available", style=f"{muted} italic")
+
+        # Build SHORT column
+        short_text = Text()
+        if state.short_params:
+            sp = state.short_params
+            max_hold_display = self._format_max_hold(sp.max_hold_time_ms)
+            is_default = sp.entries == 0  # entries=0 means using config defaults
+
+            short_text.append("SHORT", style=f"bold {success} underline")
+            if is_default:
+                short_text.append(" [DEFAULT]", style=warning)
+            short_text.append("\n")
+            short_text.append(f"  Price Move:    {sp.price_move:+.1f}%\n", style="")
+            short_text.append(f"  Time Window:   {sp.time_window}ms\n", style="")
+            short_text.append(f"  Delta Thresh:  {sp.delta_threshold:+.0f}%\n", style="")
+            short_text.append(f"  Min DCA Dist:  {sp.dca_distance_pct:+.1f}%\n", style=secondary)
+            short_text.append(f"  Fallback TP:   {sp.target_profit:.1f}%\n", style=success)
+            short_text.append(f"  Stop Loss:     {sp.stop_loss:.1f}%\n", style=error)
+            short_text.append(f"  Max Hold:      {max_hold_display}\n", style=warning)
+            short_text.append("  ───────────────────\n", style=muted)
+            short_text.append(f"  Win Rate:      {sp.win_rate * 100:.1f}%\n", style="bold")
+            short_text.append(f"  Entries:       {sp.entries}\n", style=muted)
+            short_text.append(
+                f"  Avg PnL:       {sp.avg_pnl:+.2f}%\n",
+                style=success if sp.avg_pnl >= 0 else error,
+            )
+        else:
+            short_text.append("SHORT\n", style=f"bold {success} underline")
+            short_text.append("  Not available", style=f"{muted} italic")
+
+        # Separator (11 pipes for 11 lines: header + 7 params + separator + 3 stats)
+        sep_text = Text("│\n│\n│\n│\n│\n│\n│\n│\n│\n│\n│", style=muted)
+
+        table.add_row(long_text, sep_text, short_text)
+
+        return Panel(
+            table,
+            title=f"Bootstrap Parameters ({state.source})",
+            border_style=accent if state.source == "cached" else secondary,
+        )
+
+    def _build_session_levels_section(self) -> Panel:
+        """Build Session Levels section showing TP/DCA zones from continuous learning."""
+        colors = self._get_theme_colors_dict()
+        success = colors["success"]
+        error = colors["error"]
+        warning = colors["warning"]
+        accent = colors["accent"]
+        secondary = colors["secondary"]
+        muted = colors["muted"]
+
+        if self._session_levels is None or not self._session_levels.levels:
+            content = Text()
+            content.append("No session levels computed yet.\n", style=f"{muted} italic")
+            content.append("Session levels provide dynamic TP/DCA zones\n", style=muted)
+            content.append("based on unfilled POC and imbalance levels.", style=muted)
+            return Panel(content, title="Session Levels", border_style=muted)
+
+        cache = self._session_levels
+        current_price = self._state.current_price if self._state else 0.0
+
+        # Create side-by-side table for LONG and SHORT zones
+        table = Table.grid(padding=(0, 2))
+        table.add_column(width=32)  # LONG column
+        table.add_column(width=2)  # Separator
+        table.add_column(width=32)  # SHORT column
+
+        # Build LONG zones column
+        long_text = Text()
+        long_text.append("LONG ZONES", style=f"bold {error} underline")
+        long_text.append("\n")
+
+        # TP zones (levels above current price)
+        long_text.append("  Take Profit:\n", style=f"{success} bold")
+        if cache.tp_levels_long:
+            for i, level in enumerate(cache.tp_levels_long[:3]):  # Show top 3
+                distance = level.distance_from_price(current_price)
+                session_short = level.session[:3]  # Abbreviate session name
+                long_text.append(f"    {level.price:.4f}", style=success)
+                long_text.append(f" (+{distance:.1f}%)", style=muted)
+                long_text.append(f" {session_short}", style=f"{accent} {muted}")
+                long_text.append(f" {level.level_type.value}\n", style=muted)
+        else:
+            long_text.append("    None available\n", style=f"{muted} italic")
+
+        # DCA zones (levels below current price)
+        long_text.append("  DCA Zones:\n", style=f"{secondary} bold")
+        if cache.dca_levels_long:
+            for i, level in enumerate(cache.dca_levels_long[:3]):  # Show top 3
+                distance = level.distance_from_price(current_price)
+                session_short = level.session[:3]
+                long_text.append(f"    {level.price:.4f}", style=secondary)
+                long_text.append(f" ({distance:.1f}%)", style=muted)
+                long_text.append(f" {session_short}", style=f"{accent} {muted}")
+                long_text.append(f" {level.level_type.value}\n", style=muted)
+        else:
+            long_text.append("    None available\n", style=f"{muted} italic")
+
+        # Build SHORT zones column
+        short_text = Text()
+        short_text.append("SHORT ZONES", style=f"bold {success} underline")
+        short_text.append("\n")
+
+        # TP zones (levels below current price)
+        short_text.append("  Take Profit:\n", style=f"{success} bold")
+        if cache.tp_levels_short:
+            for i, level in enumerate(cache.tp_levels_short[:3]):  # Show top 3
+                distance = level.distance_from_price(current_price)
+                session_short = level.session[:3]
+                short_text.append(f"    {level.price:.4f}", style=success)
+                short_text.append(f" ({distance:.1f}%)", style=muted)
+                short_text.append(f" {session_short}", style=f"{accent} {muted}")
+                short_text.append(f" {level.level_type.value}\n", style=muted)
+        else:
+            short_text.append("    None available\n", style=f"{muted} italic")
+
+        # DCA zones (levels above current price)
+        short_text.append("  DCA Zones:\n", style=f"{secondary} bold")
+        if cache.dca_levels_short:
+            for i, level in enumerate(cache.dca_levels_short[:3]):  # Show top 3
+                distance = level.distance_from_price(current_price)
+                session_short = level.session[:3]
+                short_text.append(f"    {level.price:.4f}", style=secondary)
+                short_text.append(f" (+{distance:.1f}%)", style=muted)
+                short_text.append(f" {session_short}", style=f"{accent} {muted}")
+                short_text.append(f" {level.level_type.value}\n", style=muted)
+        else:
+            short_text.append("    None available\n", style=f"{muted} italic")
+
+        # Separator
+        sep_text = Text("│\n│\n│\n│\n│\n│\n│\n│", style=muted)
+
+        table.add_row(long_text, sep_text, short_text)
+
+        # Summary footer
+        total_unfilled = len([l for l in cache.levels if l.is_unfilled])
+        total_levels = len(cache.levels)
+        footer = Text()
+        footer.append(f"\n  {total_unfilled}/{total_levels} unfilled levels", style=muted)
+        if current_price > 0:
+            footer.append(f"  │  Current: {current_price:.4f}", style=muted)
+
+        # Determine border style
+        has_tp = bool(cache.tp_levels_long or cache.tp_levels_short)
+        has_dca = bool(cache.dca_levels_long or cache.dca_levels_short)
+
+        if has_tp and has_dca:
+            border = accent
+        elif has_tp or has_dca:
+            border = secondary
+        else:
+            border = muted
+
+        return Panel(
+            Group(table, footer),
+            title="Session Levels",
+            border_style=border,
+        )
+
+    def _build_delta_section(self, state: APEXTUIState) -> Panel:
+        """Build Volume Delta visualization - clean table-based layout."""
+        colors = self._get_theme_colors_dict()
+        success = colors["success"]
+        error = colors["error"]
+        warning = colors["warning"]
+        muted = colors["muted"]
+
+        # Get thresholds from optimized params or use defaults
+        long_thresh = state.long_params.delta_threshold if state.long_params else -50.0
+        short_thresh = state.short_params.delta_threshold if state.short_params else 50.0
+
+        # For display, show the more "active" delta (whichever is closer to triggering)
+        # LONG uses delta from high, SHORT uses delta from low
+        long_delta = state.long_volume_delta
+        short_delta = state.short_volume_delta
+
+        # Pick which delta to display based on which is more relevant
+        # If negative (selling), show long_delta; if positive (buying), show short_delta
+        if long_delta <= 0 and short_delta <= 0:
+            delta = long_delta  # More selling, show long delta
+        elif long_delta >= 0 and short_delta >= 0:
+            delta = short_delta  # More buying, show short delta
+        else:
+            # Mixed - show whichever is stronger
+            delta = long_delta if abs(long_delta) > abs(short_delta) else short_delta
+
+        # Determine pressure and style
+        if delta <= long_thresh:
+            pressure_text = "SELLING PRESSURE"
+            pressure_style = f"bold {error}"
+            delta_style = f"bold {error}"
+        elif delta >= short_thresh:
+            pressure_text = "BUYING PRESSURE"
+            pressure_style = f"bold {success}"
+            delta_style = f"bold {success}"
+        else:
+            pressure_text = "NEUTRAL"
+            pressure_style = warning
+            delta_style = warning
+
+        # Use a table for proper alignment - expands to fill width
+        table = Table.grid(expand=True)
+        table.add_column(ratio=1)  # Left (value)
+        table.add_column(ratio=1)  # Right (pressure indicator)
+
+        # Row 1: Current value and pressure
+        left_text = Text()
+        left_text.append("Current: ", style=muted)
+        left_text.append(f"{delta:+.1f}%", style=delta_style)
+
+        right_text = Text(f"► {pressure_text}", style=pressure_style, justify="right")
+
+        table.add_row(left_text, right_text)
+
+        # Row 2: Scale bar (uses Bar from rich for proper width handling)
+        # Build scale with labeled endpoints
+        scale_table = Table.grid(expand=True)
+        scale_table.add_column(width=6, justify="left")  # -100%
+        scale_table.add_column(ratio=1, justify="center")  # bar
+        scale_table.add_column(width=5, justify="right")  # +100%
+
+        # Build the bar as text with proportional segments
+        bar = self._build_proportional_bar(delta, long_thresh, short_thresh)
+
+        scale_table.add_row(
+            Text("-100%", style=f"{error} {muted}"),
+            bar,
+            Text("+100%", style=f"{success} {muted}"),
+        )
+
+        # Row 3: Threshold markers - use same table structure for alignment
+        thresh_table = Table.grid(expand=True)
+        thresh_table.add_column(width=6, justify="left")  # matches -100%
+        thresh_table.add_column(ratio=1, justify="center")  # centered labels
+        thresh_table.add_column(width=5, justify="right")  # matches +100%
+
+        thresh_text = Text(justify="center")
+        thresh_text.append("LONG ", style=error)
+        thresh_text.append(f"≤{long_thresh:.0f}%", style=f"{error} bold")
+        thresh_text.append("        ", style=muted)
+        thresh_text.append("0%", style=muted)
+        thresh_text.append("        ", style=muted)
+        thresh_text.append(f"≥{short_thresh:.0f}%", style=f"{success} bold")
+        thresh_text.append(" SHORT", style=success)
+
+        thresh_table.add_row(Text(""), thresh_text, Text(""))
+
+        return Panel(
+            Group(table, Text(), scale_table, thresh_table),
+            title="Imbalance",
+            border_style=error
+            if delta <= long_thresh
+            else (success if delta >= short_thresh else muted),
+        )
+
+    def _build_proportional_bar(
+        self, delta: float, long_thresh: float, short_thresh: float
+    ) -> Text:
+        """Build a proportional bar that scales with container width."""
+        colors = self._get_theme_colors_dict()
+        success = colors["success"]
+        error = colors["error"]
+        warning = colors["warning"]
+        muted = colors["muted"]
+
+        # The bar will be rendered by Rich which handles width automatically
+        # We use a simpler approach: show zones with the current position
+
+        # Normalize to 0-100 range
+        delta_norm = (delta + 100) / 2
+        long_norm = (long_thresh + 100) / 2
+        short_norm = (short_thresh + 100) / 2
+
+        # Determine which zone we're in
+        if delta <= long_thresh:
+            marker_style = f"bold {error}"
+        elif delta >= short_thresh:
+            marker_style = f"bold {success}"
+        else:
+            marker_style = f"bold {warning}"
+
+        # Build visual representation
+        # Use block characters: ▓ for filled, ░ for unfilled
+        bar = Text()
+
+        # Show as: [SELL zone]|---[marker]---[neutral]---[marker]---|[BUY zone]
+        # Simplified: just show position indicator with zone coloring
+
+        total_width = 70  # Wider bar to fill available panel space
+        delta_pos = int(delta_norm / 100 * total_width)
+        delta_pos = max(0, min(total_width - 1, delta_pos))
+        long_pos = int(long_norm / 100 * total_width)
+        short_pos = int(short_norm / 100 * total_width)
+        center = total_width // 2
+
+        bar.append("◄", style=f"{error} {muted}")
+
+        for i in range(total_width):
+            if i == delta_pos:
+                bar.append("█", style=marker_style)
+            elif i == long_pos:
+                bar.append("│", style=error)
+            elif i == short_pos:
+                bar.append("│", style=success)
+            elif i == center:
+                bar.append("┼", style=muted)
+            elif i < long_pos:
+                bar.append("─", style=f"{error} {muted}")
+            elif i > short_pos:
+                bar.append("─", style=f"{success} {muted}")
+            else:
+                bar.append("─", style=muted)
+
+        bar.append("►", style=f"{success} {muted}")
+
+        return bar
+
+    def _get_mode_display_info(self) -> dict:
+        """Get display information for rolling mode."""
+        return {
+            "title": "Price Movement",
+            "long_desc": "Price drops from high → BUY expecting bounce",
+            "short_desc": "Price rises from low → SELL expecting drop",
+        }
+
+    def _get_current_values(self, state: APEXTUIState) -> tuple[float, float]:
+        """Get current LONG and SHORT price move values."""
+        return state.price_move_from_high, state.price_move_from_low
+
+    def _build_price_movement_section(self, state: APEXTUIState) -> Panel:
+        """Build combined Price Movement section for LONG and SHORT."""
+        colors = self._get_theme_colors_dict()
+        success = colors["success"]
+        error = colors["error"]
+        warning = colors["warning"]
+        accent = colors["accent"]
+        muted = colors["muted"]
+
+        content_parts = []
+        mode_info = self._get_mode_display_info()
+        long_value, short_value = self._get_current_values(state)
+
+        # LONG subsection
+        # Use effective trigger threshold (with offset applied)
+        long_trigger = state.long_trigger_threshold() if state.long_params else -2.0
+        long_base = state.long_params.price_move if state.long_params else -2.0
+
+        long_header = Text()
+        long_header.append("LONG", style=f"bold {error}")
+        long_header.append(f": {mode_info['long_desc']}", style=f"{muted} italic")
+        content_parts.append(long_header)
+
+        long_info = Text()
+        long_info.append(f"High: {state.rolling_high:.4f}", style=muted)
+        long_info.append(" → ", style=muted)
+        long_info.append(f"Current: {state.current_price:.4f}", style="")
+        content_parts.append(long_info)
+
+        long_bar = self._build_price_move_bar(
+            long_value, long_trigger, long_base, state.long_signal_offset, error, is_long=True
+        )
+        content_parts.append(long_bar)
+
+        long_status = Text()
+        if long_value <= long_trigger:
+            long_status.append("Status: ", style=muted)
+            long_status.append("TRIGGERED", style=f"bold {error} on black")
+        else:
+            long_status.append("Status: ", style=muted)
+            long_status.append(
+                f"WAITING (need {long_trigger:.1f}%, currently {long_value:+.2f}%)", style=muted
+            )
+        content_parts.append(long_status)
+
+        content_parts.append(Text())  # Spacer
+
+        # SHORT subsection
+        # Use effective trigger threshold (with offset applied)
+        short_trigger = state.short_trigger_threshold() if state.short_params else 2.0
+        short_base = state.short_params.price_move if state.short_params else 2.0
+
+        short_header = Text()
+        short_header.append("SHORT", style=f"bold {success}")
+        short_header.append(f": {mode_info['short_desc']}", style=f"{muted} italic")
+        content_parts.append(short_header)
+
+        short_info = Text()
+        short_info.append(f"Low: {state.rolling_low:.4f}", style=muted)
+        short_info.append(" → ", style=muted)
+        short_info.append(f"Current: {state.current_price:.4f}", style="")
+        content_parts.append(short_info)
+
+        short_bar = self._build_price_move_bar(
+            short_value,
+            short_trigger,
+            short_base,
+            state.short_signal_offset,
+            success,
+            is_long=False,
+        )
+        content_parts.append(short_bar)
+
+        short_status = Text()
+        if short_value >= short_trigger:
+            short_status.append("Status: ", style=muted)
+            short_status.append("TRIGGERED", style=f"bold {success} on black")
+        else:
+            short_status.append("Status: ", style=muted)
+            short_status.append(
+                f"WAITING (need {short_trigger:.1f}%, currently {short_value:+.2f}%)", style=muted
+            )
+        content_parts.append(short_status)
+
+        # Determine border style based on signal readiness
+        if state.long_signal_ready or state.short_signal_ready:
+            border = warning
+        elif long_value <= long_trigger or short_value >= short_trigger:
+            border = accent
+        else:
+            border = muted
+
+        return Panel(
+            Group(*content_parts),
+            title=mode_info["title"],
+            border_style=border,
+        )
+
+    def _build_price_move_bar(
+        self,
+        current: float,
+        trigger: float,
+        base_threshold: float,
+        offset: float,
+        color: str,
+        is_long: bool,
+    ) -> Text:
+        """Build a progress bar for price move with optional trigger zone."""
+        muted = self.muted_style
+
+        bar = Text()
+        bar.append(
+            f"Move: {current:+.2f}%  ",
+            style=color
+            if (is_long and current <= trigger) or (not is_long and current >= trigger)
+            else "",
+        )
+
+        width = 40
+
+        if is_long:
+            # For LONG, progress goes from 0% (no drop) to trigger (e.g., -3.25%)
+            # Map: 0% -> 0, trigger -> 100%
+            if trigger != 0:
+                progress = min(1.0, max(0.0, current / trigger))
+            else:
+                progress = 0
+        else:
+            # For SHORT, progress goes from 0% (no rise) to trigger (e.g., +5%)
+            if trigger != 0:
+                progress = min(1.0, max(0.0, current / trigger))
+            else:
+                progress = 0
+
+        filled = int(progress * width)
+        bar.append("▓" * filled, style=f"bold {color}")
+        bar.append("░" * (width - filled), style=muted)
+
+        # Show trigger info with offset zone if applicable
+        if offset > 0:
+            # Show trigger zone: e.g., "Trigger: -3.25% (-3.5%+0.25)"
+            bar.append(f"  Trigger: {trigger:+.1f}%", style=f"{color} {muted}")
+            bar.append(f" ({base_threshold:+.1f}%", style=muted)
+            if is_long:
+                bar.append(f"+{offset:.2f})", style=muted)
+            else:
+                bar.append(f"-{offset:.1f})", style=muted)
+        else:
+            bar.append(f"  Trigger: {trigger:+.1f}%", style=f"{color} {muted}")
+
+        return bar
+
+    def _build_signal_readiness(self, state: APEXTUIState) -> Panel:
+        """Build signal readiness checklist.
+
+        When NO position: Shows Entry Conditions (2 checks: delta + price move)
+        When HAS position: Shows DCA Conditions (3 checks: delta + price move + distance)
+        """
+        colors = self._get_theme_colors_dict()
+        success = colors["success"]
+        error = colors["error"]
+        warning = colors["warning"]
+        accent = colors["accent"]
+        secondary = colors["secondary"]
+        muted = colors["muted"]
+
+        long_value, short_value = self._get_current_values(state)
+
+        # Get thresholds (use effective trigger with offset applied)
+        long_delta_thresh = state.long_params.delta_threshold if state.long_params else -50.0
+        long_pm_thresh = state.long_trigger_threshold() if state.long_params else -2.0
+        short_delta_thresh = state.short_params.delta_threshold if state.short_params else 50.0
+        short_pm_thresh = state.short_trigger_threshold() if state.short_params else 2.0
+
+        # Check conditions (using separate deltas from high/low timestamps)
+        # LONG: uses delta calculated from when rolling high was established
+        # SHORT: uses delta calculated from when rolling low was established
+        long_delta_ok = state.long_volume_delta <= long_delta_thresh
+        long_pm_ok = long_value <= long_pm_thresh
+        short_delta_ok = state.short_volume_delta >= short_delta_thresh
+        short_pm_ok = short_value >= short_pm_thresh
+
+        # Build table
+        table = Table.grid(padding=(0, 3))
+        table.add_column(width=35)  # LONG column
+        table.add_column(width=35)  # SHORT column
+
+        # ========== LONG COLUMN ==========
+        long_text = Text()
+        long_text.append("LONG", style=f"bold {error} underline")
+        long_text.append("\n")
+        long_text.append("─" * 30 + "\n", style=muted)
+
+        if state.has_long_position:
+            # === HAS POSITION: Show DCA Conditions (5 checks) ===
+            long_text.append(f"Position: {state.long_position_size:.2f} USDT", style=secondary)
+            long_text.append(f" @ {state.long_position_entry:.6f}\n", style=muted)
+            long_text.append(
+                f"  From Entry: {state.long_price_from_entry:+.2f}%\n",
+                style=error if state.long_price_from_entry < 0 else success,
+            )
+            long_text.append("─" * 30 + "\n", style=muted)
+            long_text.append("DCA Conditions:\n", style=f"{secondary} bold")
+
+            # DCA distance threshold
+            dca_thresh = state.long_params.dca_distance_pct if state.long_params else -5.0
+            long_dca_dist_ok = state.long_price_from_entry <= dca_thresh
+            # Size check
+            long_can_dca = state.long_position_size < state.long_max_position_size
+
+            # Check 1: Bootstrap (REQUIRED)
+            check = "✓" if state.is_bootstrapped else "✗"
+            style = f"{success} bold" if state.is_bootstrapped else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(" Bootstrap", style="" if state.is_bootstrapped else muted)
+            long_text.append(f" ({state.source})\n" if state.is_bootstrapped else " (waiting)\n", style=muted)
+
+            # Check 2: Delta (from when rolling high was established)
+            check = "✓" if long_delta_ok else "✗"
+            style = f"{success} bold" if long_delta_ok else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(f" Delta ≤ {long_delta_thresh:.0f}%", style="" if long_delta_ok else muted)
+            long_text.append(f" ({state.long_volume_delta:+.1f}%)\n", style=muted)
+
+            # Check 3: Price Move
+            check = "✓" if long_pm_ok else "✗"
+            style = f"{success} bold" if long_pm_ok else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(f" Price Move ≤ {long_pm_thresh:.1f}%", style="" if long_pm_ok else muted)
+            long_text.append(f" ({long_value:+.2f}%)\n", style=muted)
+
+            # Check 4: Distance from entry price
+            check = "✓" if long_dca_dist_ok else "✗"
+            style = f"{success} bold" if long_dca_dist_ok else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(f" From Entry ≤ {dca_thresh:+.1f}%", style="" if long_dca_dist_ok else muted)
+            long_text.append(f" ({state.long_price_from_entry:+.2f}%)\n", style=muted)
+
+            # Check 5: Position size < max
+            check = "✓" if long_can_dca else "✗"
+            style = f"{success} bold" if long_can_dca else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(f" Size < {state.long_max_position_size:.0f}", style="" if long_can_dca else muted)
+            long_text.append(f" ({state.long_position_size:.0f} USDT)\n", style=muted)
+
+            long_text.append("─" * 30 + "\n", style=muted)
+
+            # Progress bar (5 conditions)
+            long_conditions_met = sum([state.is_bootstrapped, long_delta_ok, long_pm_ok, long_dca_dist_ok, long_can_dca])
+            all_met = long_conditions_met == 5
+            if all_met:
+                long_text.append("▓" * 20, style=f"bold {error}")
+                long_text.append(" READY!", style=f"bold {error}")
+            else:
+                filled = int(long_conditions_met * 4)
+                long_text.append("▓" * filled, style=error)
+                long_text.append("░" * (20 - filled), style=muted)
+                long_text.append(f" {long_conditions_met}/5", style=muted)
+        else:
+            # === NO POSITION: Show Entry Conditions (3 checks) ===
+            long_text.append("Entry Conditions:\n", style=f"{secondary} bold")
+
+            # Check 1: Bootstrap (REQUIRED)
+            check = "✓" if state.is_bootstrapped else "✗"
+            style = f"{success} bold" if state.is_bootstrapped else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(" Bootstrap", style="" if state.is_bootstrapped else muted)
+            long_text.append(f" ({state.source})\n" if state.is_bootstrapped else " (waiting)\n", style=muted)
+
+            # Check 2: Delta (from when rolling high was established)
+            check = "✓" if long_delta_ok else "✗"
+            style = f"{success} bold" if long_delta_ok else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(f" Delta ≤ {long_delta_thresh:.0f}%", style="" if long_delta_ok else muted)
+            long_text.append(f" ({state.long_volume_delta:+.1f}%)\n", style=muted)
+
+            # Check 3: Price Move
+            check = "✓" if long_pm_ok else "✗"
+            style = f"{success} bold" if long_pm_ok else error
+            long_text.append(f"[{check}]", style=style)
+            long_text.append(f" Price Move ≤ {long_pm_thresh:.1f}%", style="" if long_pm_ok else muted)
+            long_text.append(f" ({long_value:+.2f}%)\n", style=muted)
+
+            long_text.append("─" * 30 + "\n", style=muted)
+
+            # Progress bar (3 conditions)
+            long_conditions_met = sum([state.is_bootstrapped, long_delta_ok, long_pm_ok])
+            if state.long_signal_ready and state.is_bootstrapped:
+                long_text.append("▓" * 20, style=f"bold {error}")
+                long_text.append(" READY!", style=f"bold {error}")
+            else:
+                filled = int(long_conditions_met / 3 * 20)
+                long_text.append("▓" * filled, style=error)
+                long_text.append("░" * (20 - filled), style=muted)
+                long_text.append(f" {long_conditions_met}/3", style=muted)
+
+        # ========== SHORT COLUMN ==========
+        short_text = Text()
+        short_text.append("SHORT", style=f"bold {success} underline")
+        short_text.append("\n")
+        short_text.append("─" * 30 + "\n", style=muted)
+
+        if state.has_short_position:
+            # === HAS POSITION: Show DCA Conditions (5 checks) ===
+            short_text.append(f"Position: {state.short_position_size:.2f} USDT", style=secondary)
+            short_text.append(f" @ {state.short_position_entry:.6f}\n", style=muted)
+            short_text.append(
+                f"  From Entry: {state.short_price_from_entry:+.2f}%\n",
+                style=success if state.short_price_from_entry > 0 else error,
+            )
+            short_text.append("─" * 30 + "\n", style=muted)
+            short_text.append("DCA Conditions:\n", style=f"{secondary} bold")
+
+            # DCA distance threshold
+            dca_thresh = state.short_params.dca_distance_pct if state.short_params else 5.0
+            short_dca_dist_ok = state.short_price_from_entry >= dca_thresh
+            # Size check
+            short_can_dca = state.short_position_size < state.short_max_position_size
+
+            # Check 1: Bootstrap (REQUIRED)
+            check = "✓" if state.is_bootstrapped else "✗"
+            style = f"{success} bold" if state.is_bootstrapped else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(" Bootstrap", style="" if state.is_bootstrapped else muted)
+            short_text.append(f" ({state.source})\n" if state.is_bootstrapped else " (waiting)\n", style=muted)
+
+            # Check 2: Delta (from when rolling low was established)
+            check = "✓" if short_delta_ok else "✗"
+            style = f"{success} bold" if short_delta_ok else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(f" Delta ≥ {short_delta_thresh:.0f}%", style="" if short_delta_ok else muted)
+            short_text.append(f" ({state.short_volume_delta:+.1f}%)\n", style=muted)
+
+            # Check 3: Price Move
+            check = "✓" if short_pm_ok else "✗"
+            style = f"{success} bold" if short_pm_ok else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(f" Price Move ≥ {short_pm_thresh:.1f}%", style="" if short_pm_ok else muted)
+            short_text.append(f" ({short_value:+.2f}%)\n", style=muted)
+
+            # Check 4: Distance from entry price
+            check = "✓" if short_dca_dist_ok else "✗"
+            style = f"{success} bold" if short_dca_dist_ok else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(f" From Entry ≥ {dca_thresh:+.1f}%", style="" if short_dca_dist_ok else muted)
+            short_text.append(f" ({state.short_price_from_entry:+.2f}%)\n", style=muted)
+
+            # Check 5: Position size < max
+            check = "✓" if short_can_dca else "✗"
+            style = f"{success} bold" if short_can_dca else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(f" Size < {state.short_max_position_size:.0f}", style="" if short_can_dca else muted)
+            short_text.append(f" ({state.short_position_size:.0f} USDT)\n", style=muted)
+
+            short_text.append("─" * 30 + "\n", style=muted)
+
+            # Progress bar (5 conditions)
+            short_conditions_met = sum([state.is_bootstrapped, short_delta_ok, short_pm_ok, short_dca_dist_ok, short_can_dca])
+            all_met = short_conditions_met == 5
+            if all_met:
+                short_text.append("▓" * 20, style=f"bold {success}")
+                short_text.append(" READY!", style=f"bold {success}")
+            else:
+                filled = int(short_conditions_met * 4)
+                short_text.append("▓" * filled, style=success)
+                short_text.append("░" * (20 - filled), style=muted)
+                short_text.append(f" {short_conditions_met}/5", style=muted)
+        else:
+            # === NO POSITION: Show Entry Conditions (3 checks) ===
+            short_text.append("Entry Conditions:\n", style=f"{secondary} bold")
+
+            # Check 1: Bootstrap (REQUIRED)
+            check = "✓" if state.is_bootstrapped else "✗"
+            style = f"{success} bold" if state.is_bootstrapped else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(" Bootstrap", style="" if state.is_bootstrapped else muted)
+            short_text.append(f" ({state.source})\n" if state.is_bootstrapped else " (waiting)\n", style=muted)
+
+            # Check 2: Delta (from when rolling low was established)
+            check = "✓" if short_delta_ok else "✗"
+            style = f"{success} bold" if short_delta_ok else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(f" Delta ≥ {short_delta_thresh:.0f}%", style="" if short_delta_ok else muted)
+            short_text.append(f" ({state.short_volume_delta:+.1f}%)\n", style=muted)
+
+            # Check 3: Price Move
+            check = "✓" if short_pm_ok else "✗"
+            style = f"{success} bold" if short_pm_ok else error
+            short_text.append(f"[{check}]", style=style)
+            short_text.append(f" Price Move ≥ {short_pm_thresh:.1f}%", style="" if short_pm_ok else muted)
+            short_text.append(f" ({short_value:+.2f}%)\n", style=muted)
+
+            short_text.append("─" * 30 + "\n", style=muted)
+
+            # Progress bar (3 conditions)
+            short_conditions_met = sum([state.is_bootstrapped, short_delta_ok, short_pm_ok])
+            if state.short_signal_ready and state.is_bootstrapped:
+                short_text.append("▓" * 20, style=f"bold {success}")
+                short_text.append(" READY!", style=f"bold {success}")
+            else:
+                filled = int(short_conditions_met / 3 * 20)
+                short_text.append("▓" * filled, style=success)
+                short_text.append("░" * (20 - filled), style=muted)
+                short_text.append(f" {short_conditions_met}/3", style=muted)
+
+        table.add_row(long_text, short_text)
+
+        # Window info
+        window_text = Text()
+        window_text.append("\n")
+        window_text.append(f"Price window: {state.price_window}ms", style=muted)
+        window_text.append("  │  ", style=muted)
+        window_text.append(f"Imbalance tolerance: {state.imbalance_price_pct:.1f}%", style=muted)
+
+        # Determine border style based on any conditions met
+        long_conds = sum([long_delta_ok, long_pm_ok])
+        short_conds = sum([short_delta_ok, short_pm_ok])
+        if state.long_signal_ready or state.short_signal_ready:
+            border = f"{warning} bold"
+        elif long_conds > 0 or short_conds > 0:
+            border = accent
+        else:
+            border = muted
+
+        return Panel(
+            Group(table, window_text),
+            title="Signal Readiness",
+            border_style=border,
+        )
+
+    def update_state(self, state: APEXTUIState) -> None:
+        """
+        Update with new TUI state.
+
+        Called from APEXManager via app.
+
+        Args:
+            state: New TUI state snapshot.
+        """
+        self._state = state
+        self.trade_count = state.trade_count
+        self._update_content()
+
+    def update_session_levels(self, session_levels: SessionLevelCache) -> None:
+        """
+        Update with new session levels.
+
+        Called from APEXManager via app.
+
+        Args:
+            session_levels: New session level cache.
+        """
+        self._session_levels = session_levels
+        self._update_content()
+
+    def set_symbol(self, symbol: str | None) -> None:
+        """
+        Set the symbol to display analysis for.
+
+        Args:
+            symbol: Symbol to show, or None to clear.
+        """
+        if symbol != self._selected_symbol:
+            self._selected_symbol = symbol
+            self._state = None
+            self._session_levels = None
+            self.trade_count = 0
+            self.is_active = False
+            self._update_status()
+            self._update_content()
+
+    def set_active(self, active: bool) -> None:
+        """Set active/streaming status."""
+        self.is_active = active
+
+    def clear(self) -> None:
+        """Clear all state."""
+        self._selected_symbol = None
+        self._state = None
+        self._session_levels = None
+        self.trade_count = 0
+        self.is_active = False
+        self._update_status()
+        self._update_content()

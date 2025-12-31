@@ -1,0 +1,56 @@
+# Aequify - mise configuration
+# https://mise.jdx.dev
+
+min_version = "2024.9.5"
+
+[env]
+PROJECT_NAME = "aequify"
+_.python.venv = { path = ".venv", create = true, uv_create_args = ["--seed"] }
+
+[tools]
+python = "3.14.2"
+uv = "latest"
+ruff = "latest"
+
+[settings]
+python.uv_venv_auto = true
+
+[tasks.reset]
+description = "Reset .venv"
+run = "rm -rf .venv"
+
+[tasks.install]
+description = "Install project dependencies"
+run = "uv sync"
+
+[tasks.dev]
+description = "Install with dev dependencies"
+run = "uv sync --all-extras"
+
+[tasks.aequify]
+description = "Run Aequify TUI"
+run = "uv run mojo -I src src/main.mojo"
+
+[tasks.lint]
+description = "Run linter"
+run = "uv run ruff check src/"
+
+[tasks.lint-fix]
+description = "Run linter with auto-fix"
+run = "uv run ruff check --fix src/"
+
+[tasks.format]
+description = "Format code"
+run = "uv run ruff format src/"
+
+[tasks.typecheck]
+description = "Run type checker"
+run = "uv run mypy src/"
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "rm -rf .venv dist build *.egg-info .pytest_cache .mypy_cache .ruff_cache"
+
+[tasks.watch]
+description = "Run Aequify with auto-restart on file changes"
+run = "uv run watchfiles 'python -m aequify' src/"
