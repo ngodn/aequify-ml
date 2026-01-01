@@ -283,27 +283,51 @@ struct GPUContext:
         info.__setitem__("api_version", value=self.api_version())
         info.__setitem__("is_compatible", value=self.is_compatible())
 
-        # Compute capability (NVIDIA only, but query returns 0 on others)
-        info.__setitem__("compute_capability_major", value=self.compute_capability_major())
-        info.__setitem__("compute_capability_minor", value=self.compute_capability_minor())
-
-        # Compute units - Apple/AMD use compile-time constants, NVIDIA uses DeviceAttribute
+        # All GPU attributes - Apple/AMD use compile-time constants, NVIDIA uses DeviceAttribute
         var arch = self.ctx.arch_name()
         @parameter
         if has_apple_gpu_accelerator():
-            # Apple Metal: use compile-time constants from AppleMetalFamily
+            # Apple Metal: ALL values from compile-time constants (DeviceAttribute doesn't work)
             # GPU core count is device-specific, derive from arch_name
             var gpu_cores = 8  # Default for M1
             if arch == "apple-m2" or arch == "apple-m3" or arch == "apple-m4" or arch == "apple-m5":
                 gpu_cores = 10
+
+            # Compute capability (not applicable to Metal)
+            info.__setitem__("compute_capability_major", value=0)
+            info.__setitem__("compute_capability_minor", value=0)
+
+            # Compute units
             info.__setitem__("multiprocessor_count", value=gpu_cores)
             info.__setitem__("warp_size", value=Int(AppleMetalFamily.warp_size))
             info.__setitem__("max_threads_per_sm", value=Int(AppleMetalFamily.threads_per_multiprocessor))
             info.__setitem__("max_registers_per_block", value=Int(AppleMetalFamily.max_registers_per_block))
             info.__setitem__("max_shared_memory_per_sm", value=Int(AppleMetalFamily.shared_memory_per_multiprocessor))
+
+            # Clock rate not queryable on Metal
+            info.__setitem__("clock_rate_mhz", value=0)
+            info.__setitem__("supports_cooperative_launch", value=True)
+
+            # Thread limits (from AppleMetalFamily.max_thread_block_size)
+            info.__setitem__("max_threads_per_block", value=Int(AppleMetalFamily.max_thread_block_size))
+
+            # Block dimensions (Metal supports 1024 per dimension, limited by total threads)
+            info.__setitem__("max_block_dim_x", value=1024)
+            info.__setitem__("max_block_dim_y", value=1024)
+            info.__setitem__("max_block_dim_z", value=1024)
+
+            # Grid dimensions (Metal supports very large grids)
+            info.__setitem__("max_grid_dim_x", value=2147483647)
+            info.__setitem__("max_grid_dim_y", value=65535)
+            info.__setitem__("max_grid_dim_z", value=65535)
+
+            # Memory
+            info.__setitem__("memory_free", value=Int(mem_info[0]))
+            info.__setitem__("memory_total", value=Int(mem_info[1]))
+            info.__setitem__("max_shared_memory_per_block", value=Int(AppleMetalFamily.shared_memory_per_multiprocessor))
+
         elif has_amd_gpu_accelerator():
             # AMD ROCm/HIP: use compile-time constants from CDNA/RDNA families
-            # Determine family and CU count from arch_name (gfxXXXX)
             var cu_count = 0
             var is_cdna = False
 
@@ -336,60 +360,82 @@ struct GPUContext:
             elif arch == "gfx1201":
                 cu_count = 64   # Radeon 9070
 
+            # Compute capability (not applicable to AMD)
+            info.__setitem__("compute_capability_major", value=0)
+            info.__setitem__("compute_capability_minor", value=0)
+
             info.__setitem__("multiprocessor_count", value=cu_count)
 
             # Use appropriate family constants
             if is_cdna:
-                # CDNA uses wavefront size 64
                 if arch == "gfx950":
                     info.__setitem__("warp_size", value=Int(AMDCDNA4Family.warp_size))
                     info.__setitem__("max_threads_per_sm", value=Int(AMDCDNA4Family.threads_per_multiprocessor))
                     info.__setitem__("max_registers_per_block", value=Int(AMDCDNA4Family.max_registers_per_block))
                     info.__setitem__("max_shared_memory_per_sm", value=Int(AMDCDNA4Family.shared_memory_per_multiprocessor))
+                    info.__setitem__("max_threads_per_block", value=Int(AMDCDNA4Family.max_thread_block_size))
+                    info.__setitem__("max_shared_memory_per_block", value=Int(AMDCDNA4Family.shared_memory_per_multiprocessor))
                 else:
                     info.__setitem__("warp_size", value=Int(AMDCDNA3Family.warp_size))
                     info.__setitem__("max_threads_per_sm", value=Int(AMDCDNA3Family.threads_per_multiprocessor))
                     info.__setitem__("max_registers_per_block", value=Int(AMDCDNA3Family.max_registers_per_block))
                     info.__setitem__("max_shared_memory_per_sm", value=Int(AMDCDNA3Family.shared_memory_per_multiprocessor))
+                    info.__setitem__("max_threads_per_block", value=Int(AMDCDNA3Family.max_thread_block_size))
+                    info.__setitem__("max_shared_memory_per_block", value=Int(AMDCDNA3Family.shared_memory_per_multiprocessor))
             else:
-                # RDNA uses wavefront size 32
                 info.__setitem__("warp_size", value=Int(AMDRDNAFamily.warp_size))
                 info.__setitem__("max_threads_per_sm", value=Int(AMDRDNAFamily.threads_per_multiprocessor))
                 info.__setitem__("max_registers_per_block", value=Int(AMDRDNAFamily.max_registers_per_block))
                 info.__setitem__("max_shared_memory_per_sm", value=Int(AMDRDNAFamily.shared_memory_per_multiprocessor))
+                info.__setitem__("max_threads_per_block", value=Int(AMDRDNAFamily.max_thread_block_size))
+                info.__setitem__("max_shared_memory_per_block", value=Int(AMDRDNAFamily.shared_memory_per_multiprocessor))
+
+            # Clock rate and cooperative launch - query via HIP
+            info.__setitem__("clock_rate_mhz", value=self.clock_rate_mhz())
+            info.__setitem__("supports_cooperative_launch", value=self.supports_cooperative_launch())
+
+            # Block dimensions (AMD supports 1024 per dimension)
+            info.__setitem__("max_block_dim_x", value=1024)
+            info.__setitem__("max_block_dim_y", value=1024)
+            info.__setitem__("max_block_dim_z", value=1024)
+
+            # Grid dimensions
+            info.__setitem__("max_grid_dim_x", value=2147483647)
+            info.__setitem__("max_grid_dim_y", value=65535)
+            info.__setitem__("max_grid_dim_z", value=65535)
+
+            # Memory
+            info.__setitem__("memory_free", value=Int(mem_info[0]))
+            info.__setitem__("memory_total", value=Int(mem_info[1]))
+
         else:
             # NVIDIA: query runtime DeviceAttribute
+            info.__setitem__("compute_capability_major", value=self.compute_capability_major())
+            info.__setitem__("compute_capability_minor", value=self.compute_capability_minor())
+
             info.__setitem__("multiprocessor_count", value=self.multiprocessor_count())
             info.__setitem__("warp_size", value=self.warp_size())
             info.__setitem__("max_threads_per_sm", value=self.max_threads_per_multiprocessor())
             info.__setitem__("max_registers_per_block", value=self.max_registers_per_block())
             info.__setitem__("max_registers_per_sm", value=self.max_registers_per_multiprocessor())
 
-        info.__setitem__("clock_rate_mhz", value=self.clock_rate_mhz())
-        info.__setitem__("supports_cooperative_launch", value=self.supports_cooperative_launch())
+            info.__setitem__("clock_rate_mhz", value=self.clock_rate_mhz())
+            info.__setitem__("supports_cooperative_launch", value=self.supports_cooperative_launch())
 
-        # Thread limits
-        info.__setitem__("max_threads_per_block", value=self.max_threads_per_block())
-
-        # max_blocks_per_sm only available on NVIDIA (AMD/Apple don't expose this)
-        @parameter
-        if has_nvidia_gpu_accelerator():
+            info.__setitem__("max_threads_per_block", value=self.max_threads_per_block())
             info.__setitem__("max_blocks_per_sm", value=self.max_blocks_per_multiprocessor())
 
-        # Block dimensions
-        info.__setitem__("max_block_dim_x", value=self.max_block_dim_x())
-        info.__setitem__("max_block_dim_y", value=self.max_block_dim_y())
-        info.__setitem__("max_block_dim_z", value=self.max_block_dim_z())
+            info.__setitem__("max_block_dim_x", value=self.max_block_dim_x())
+            info.__setitem__("max_block_dim_y", value=self.max_block_dim_y())
+            info.__setitem__("max_block_dim_z", value=self.max_block_dim_z())
 
-        # Grid dimensions
-        info.__setitem__("max_grid_dim_x", value=self.max_grid_dim_x())
-        info.__setitem__("max_grid_dim_y", value=self.max_grid_dim_y())
-        info.__setitem__("max_grid_dim_z", value=self.max_grid_dim_z())
+            info.__setitem__("max_grid_dim_x", value=self.max_grid_dim_x())
+            info.__setitem__("max_grid_dim_y", value=self.max_grid_dim_y())
+            info.__setitem__("max_grid_dim_z", value=self.max_grid_dim_z())
 
-        # Memory
-        info.__setitem__("memory_free", value=Int(mem_info[0]))
-        info.__setitem__("memory_total", value=Int(mem_info[1]))
-        info.__setitem__("max_shared_memory_per_block", value=self.max_shared_memory_per_block())
+            info.__setitem__("memory_free", value=Int(mem_info[0]))
+            info.__setitem__("memory_total", value=Int(mem_info[1]))
+            info.__setitem__("max_shared_memory_per_block", value=self.max_shared_memory_per_block())
 
         return info
 
