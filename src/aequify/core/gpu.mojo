@@ -6,7 +6,12 @@ Provides GPUContext struct for Mojo and Python-callable functions.
 
 from python import Python, PythonObject
 from python.bindings import PythonModuleBuilder
-from sys.info import has_accelerator
+from sys import (
+    has_accelerator,
+    has_amd_gpu_accelerator,
+    has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
+)
 from gpu.host import DeviceContext, DeviceStream, DeviceAttribute
 
 
@@ -22,13 +27,49 @@ fn _get_logger() raises -> PythonObject:
 
 
 # =============================================================================
-# GPU Functions
+# GPU Detection Functions
 # =============================================================================
 
 
 fn gpu_available() -> Bool:
-    """Check if GPU acceleration is available."""
+    """Check if any GPU acceleration is available."""
     return has_accelerator()
+
+
+fn has_nvidia_gpu() -> Bool:
+    """Check if NVIDIA GPU (CUDA) is available."""
+    return has_nvidia_gpu_accelerator()
+
+
+fn has_amd_gpu() -> Bool:
+    """Check if AMD GPU (ROCm/HIP) is available."""
+    return has_amd_gpu_accelerator()
+
+
+fn has_apple_gpu() -> Bool:
+    """Check if Apple GPU (Metal) is available."""
+    return has_apple_gpu_accelerator()
+
+
+fn gpu_vendor() -> String:
+    """
+    Get the GPU vendor type.
+
+    Returns:
+        "nvidia" for NVIDIA GPUs (CUDA).
+        "amd" for AMD GPUs (ROCm/HIP).
+        "apple" for Apple GPUs (Metal).
+        "none" if no GPU is available.
+    """
+    @parameter
+    if has_nvidia_gpu_accelerator():
+        return "nvidia"
+    elif has_amd_gpu_accelerator():
+        return "amd"
+    elif has_apple_gpu_accelerator():
+        return "apple"
+    else:
+        return "none"
 
 
 fn device_count() raises -> Int:
@@ -222,6 +263,12 @@ struct GPUContext:
         var mem_info = self.memory_info()
 
         var info = Python.dict()
+        # Vendor detection (compile-time)
+        info.__setitem__("vendor", value=gpu_vendor())
+        info.__setitem__("is_nvidia", value=has_nvidia_gpu())
+        info.__setitem__("is_amd", value=has_amd_gpu())
+        info.__setitem__("is_apple", value=has_apple_gpu())
+
         # Device identification
         info.__setitem__("name", value=self.ctx.name())
         info.__setitem__("device_id", value=Int(self.ctx.id()))
@@ -278,6 +325,34 @@ fn gpu_available_py(args: PythonObject) raises -> PythonObject:
     return PythonObject(available)
 
 
+fn has_nvidia_gpu_py(args: PythonObject) raises -> PythonObject:
+    var logger = _get_logger()
+    var result = has_nvidia_gpu()
+    logger.debug("has_nvidia_gpu() called, result: " + String(result))
+    return PythonObject(result)
+
+
+fn has_amd_gpu_py(args: PythonObject) raises -> PythonObject:
+    var logger = _get_logger()
+    var result = has_amd_gpu()
+    logger.debug("has_amd_gpu() called, result: " + String(result))
+    return PythonObject(result)
+
+
+fn has_apple_gpu_py(args: PythonObject) raises -> PythonObject:
+    var logger = _get_logger()
+    var result = has_apple_gpu()
+    logger.debug("has_apple_gpu() called, result: " + String(result))
+    return PythonObject(result)
+
+
+fn gpu_vendor_py(args: PythonObject) raises -> PythonObject:
+    var logger = _get_logger()
+    var vendor = gpu_vendor()
+    logger.debug("gpu_vendor() called, result: " + vendor)
+    return PythonObject(vendor)
+
+
 fn device_count_py(args: PythonObject) raises -> PythonObject:
     var logger = _get_logger()
     var count = device_count()
@@ -298,7 +373,11 @@ fn PyInit_gpu() -> PythonObject:
     """Initialize the gpu Python module."""
     try:
         var m = PythonModuleBuilder("gpu")
-        m.def_function[gpu_available_py]("gpu_available", docstring="Check if GPU is available")
+        m.def_function[gpu_available_py]("gpu_available", docstring="Check if any GPU is available")
+        m.def_function[has_nvidia_gpu_py]("has_nvidia_gpu", docstring="Check if NVIDIA GPU is available")
+        m.def_function[has_amd_gpu_py]("has_amd_gpu", docstring="Check if AMD GPU is available")
+        m.def_function[has_apple_gpu_py]("has_apple_gpu", docstring="Check if Apple GPU is available")
+        m.def_function[gpu_vendor_py]("gpu_vendor", docstring="Get GPU vendor (nvidia/amd/apple/none)")
         m.def_function[device_count_py]("device_count", docstring="Get number of GPU devices")
         m.def_function[get_all_info_py]("get_all_info", docstring="Get all GPU info as dict")
         return m.finalize()

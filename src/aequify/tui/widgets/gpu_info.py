@@ -128,14 +128,19 @@ class GPUInfoModal(ModalScreen[None]):
 
         # Header
         name = info.get("name", "Unknown GPU")
+        vendor = str(info.get("vendor", "unknown")).upper()
         api = str(info.get("api", "")).upper()
         arch = info.get("arch", "")
         cc_major = info.get("compute_capability_major", 0)
         cc_minor = info.get("compute_capability_minor", 0)
         is_compat = info.get("is_compatible", False)
 
+        # Vendor color
+        vendor_style = {"NVIDIA": "green", "AMD": "red", "APPLE": "magenta"}.get(vendor, "dim")
+
         header_text = Text()
-        header_text.append(f"{name}\n", style="bold")
+        header_text.append(f"{name} ", style="bold")
+        header_text.append(f"[{vendor}]\n", style=vendor_style)
         header_text.append("API: ", style="dim")
         header_text.append(f"{api}    ", style="cyan")
         header_text.append("Arch: ", style="dim")

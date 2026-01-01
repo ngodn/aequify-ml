@@ -11,6 +11,7 @@ from aequify import (
     setup_uvloop,
     shutdown_all,
     gpu_available,
+    gpu_vendor,
     GPUContext,
 )
 
@@ -59,8 +60,9 @@ fn print_startup_info() raises:
         print("uvloop: not available")
 
     # GPU info
+    var vendor = gpu_vendor()
     if gpu_available():
-        print("GPU: available")
+        print("GPU: " + vendor)
         try:
             var gpu = GPUContext()
             print("  Name: " + gpu.device_name())
@@ -70,7 +72,7 @@ fn print_startup_info() raises:
         except:
             print("  (could not get GPU info)")
     else:
-        print("GPU: not available")
+        print("GPU: none")
     print("")
 
 

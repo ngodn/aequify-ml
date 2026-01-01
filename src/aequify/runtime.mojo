@@ -7,7 +7,15 @@ Provides event loop management, async execution, and GPU context from Mojo.
 from python import Python, PythonObject
 
 # Re-export GPU from core
-from .core.gpu import gpu_available, GPUContext, device_count
+from .core.gpu import (
+    gpu_available,
+    GPUContext,
+    device_count,
+    has_nvidia_gpu,
+    has_amd_gpu,
+    has_apple_gpu,
+    gpu_vendor,
+)
 
 
 # =============================================================================

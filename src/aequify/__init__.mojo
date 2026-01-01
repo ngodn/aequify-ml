@@ -16,4 +16,8 @@ from .runtime import (
     gpu_available,
     GPUContext,
     device_count,
+    has_nvidia_gpu,
+    has_amd_gpu,
+    has_apple_gpu,
+    gpu_vendor,
 )
