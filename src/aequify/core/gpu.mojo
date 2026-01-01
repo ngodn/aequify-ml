@@ -13,6 +13,12 @@ from sys import (
     has_nvidia_gpu_accelerator,
 )
 from gpu.host import DeviceContext, DeviceStream, DeviceAttribute
+from gpu.host.info import (
+    AppleMetalFamily,
+    AMDCDNA3Family,
+    AMDCDNA4Family,
+    AMDRDNAFamily,
+)
 
 
 # =============================================================================
@@ -281,9 +287,78 @@ struct GPUContext:
         info.__setitem__("compute_capability_major", value=self.compute_capability_major())
         info.__setitem__("compute_capability_minor", value=self.compute_capability_minor())
 
-        # Compute units - some not available on Apple GPUs
+        # Compute units - Apple/AMD use compile-time constants, NVIDIA uses DeviceAttribute
+        var arch = self.ctx.arch_name()
         @parameter
-        if not has_apple_gpu_accelerator():
+        if has_apple_gpu_accelerator():
+            # Apple Metal: use compile-time constants from AppleMetalFamily
+            # GPU core count is device-specific, derive from arch_name
+            var gpu_cores = 8  # Default for M1
+            if arch == "apple-m2" or arch == "apple-m3" or arch == "apple-m4" or arch == "apple-m5":
+                gpu_cores = 10
+            info.__setitem__("multiprocessor_count", value=gpu_cores)
+            info.__setitem__("warp_size", value=Int(AppleMetalFamily.warp_size))
+            info.__setitem__("max_threads_per_sm", value=Int(AppleMetalFamily.threads_per_multiprocessor))
+            info.__setitem__("max_registers_per_block", value=Int(AppleMetalFamily.max_registers_per_block))
+            info.__setitem__("max_shared_memory_per_sm", value=Int(AppleMetalFamily.shared_memory_per_multiprocessor))
+        elif has_amd_gpu_accelerator():
+            # AMD ROCm/HIP: use compile-time constants from CDNA/RDNA families
+            # Determine family and CU count from arch_name (gfxXXXX)
+            var cu_count = 0
+            var is_cdna = False
+
+            # CDNA datacenter GPUs (gfx94x, gfx95x)
+            if arch == "gfx942":
+                cu_count = 304  # MI300X
+                is_cdna = True
+            elif arch == "gfx950":
+                cu_count = 256  # MI355X
+                is_cdna = True
+            # RDNA consumer GPUs (gfx10xx, gfx11xx, gfx12xx)
+            elif arch == "gfx1030":
+                cu_count = 60   # Radeon 6900
+            elif arch == "gfx1100":
+                cu_count = 96   # Radeon 7900
+            elif arch == "gfx1101":
+                cu_count = 60   # Radeon 7800/7700
+            elif arch == "gfx1102":
+                cu_count = 32   # Radeon 7600
+            elif arch == "gfx1103":
+                cu_count = 12   # Radeon 780M
+            elif arch == "gfx1150":
+                cu_count = 12   # Radeon 880M
+            elif arch == "gfx1151":
+                cu_count = 40   # Radeon 8060S
+            elif arch == "gfx1152":
+                cu_count = 8    # Radeon 860M
+            elif arch == "gfx1200":
+                cu_count = 32   # Radeon 9060
+            elif arch == "gfx1201":
+                cu_count = 64   # Radeon 9070
+
+            info.__setitem__("multiprocessor_count", value=cu_count)
+
+            # Use appropriate family constants
+            if is_cdna:
+                # CDNA uses wavefront size 64
+                if arch == "gfx950":
+                    info.__setitem__("warp_size", value=Int(AMDCDNA4Family.warp_size))
+                    info.__setitem__("max_threads_per_sm", value=Int(AMDCDNA4Family.threads_per_multiprocessor))
+                    info.__setitem__("max_registers_per_block", value=Int(AMDCDNA4Family.max_registers_per_block))
+                    info.__setitem__("max_shared_memory_per_sm", value=Int(AMDCDNA4Family.shared_memory_per_multiprocessor))
+                else:
+                    info.__setitem__("warp_size", value=Int(AMDCDNA3Family.warp_size))
+                    info.__setitem__("max_threads_per_sm", value=Int(AMDCDNA3Family.threads_per_multiprocessor))
+                    info.__setitem__("max_registers_per_block", value=Int(AMDCDNA3Family.max_registers_per_block))
+                    info.__setitem__("max_shared_memory_per_sm", value=Int(AMDCDNA3Family.shared_memory_per_multiprocessor))
+            else:
+                # RDNA uses wavefront size 32
+                info.__setitem__("warp_size", value=Int(AMDRDNAFamily.warp_size))
+                info.__setitem__("max_threads_per_sm", value=Int(AMDRDNAFamily.threads_per_multiprocessor))
+                info.__setitem__("max_registers_per_block", value=Int(AMDRDNAFamily.max_registers_per_block))
+                info.__setitem__("max_shared_memory_per_sm", value=Int(AMDRDNAFamily.shared_memory_per_multiprocessor))
+        else:
+            # NVIDIA: query runtime DeviceAttribute
             info.__setitem__("multiprocessor_count", value=self.multiprocessor_count())
             info.__setitem__("warp_size", value=self.warp_size())
             info.__setitem__("max_threads_per_sm", value=self.max_threads_per_multiprocessor())
@@ -296,11 +371,10 @@ struct GPUContext:
         # Thread limits
         info.__setitem__("max_threads_per_block", value=self.max_threads_per_block())
 
-        # Not available on Apple or AMD GPUs
+        # max_blocks_per_sm only available on NVIDIA (AMD/Apple don't expose this)
         @parameter
-        if not (has_amd_gpu_accelerator() or has_apple_gpu_accelerator()):
+        if has_nvidia_gpu_accelerator():
             info.__setitem__("max_blocks_per_sm", value=self.max_blocks_per_multiprocessor())
-            info.__setitem__("max_shared_memory_per_sm", value=self.max_shared_memory_per_multiprocessor())
 
         # Block dimensions
         info.__setitem__("max_block_dim_x", value=self.max_block_dim_x())

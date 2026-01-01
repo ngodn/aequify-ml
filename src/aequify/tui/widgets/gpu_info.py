@@ -145,8 +145,10 @@ class GPUInfoModal(ModalScreen[None]):
         header_text.append(f"{api}    ", style="cyan")
         header_text.append("Arch: ", style="dim")
         header_text.append(f"{arch}    ", style="cyan")
-        header_text.append("Compute: ", style="dim")
-        header_text.append(f"{cc_major}.{cc_minor}    ", style="cyan")
+        # Compute capability only meaningful for NVIDIA
+        if vendor == "NVIDIA":
+            header_text.append("Compute: ", style="dim")
+            header_text.append(f"{cc_major}.{cc_minor}    ", style="cyan")
         header_text.append("Compatible: ", style="dim")
         header_text.append("Yes" if is_compat else "No", style="green" if is_compat else "red")
 
@@ -156,12 +158,26 @@ class GPUInfoModal(ModalScreen[None]):
         compute_table.add_column("Label", style="dim", width=18)
         compute_table.add_column("Value", width=14)
 
-        # Some fields not available on Apple GPUs
+        # Compute unit count - vendor-specific terminology
+        is_apple = info.get("is_apple", False)
+        is_amd = info.get("is_amd", False)
         sm_count = info.get("multiprocessor_count")
-        compute_table.add_row("Multiprocessors", f"{sm_count} SMs" if sm_count else "[dim]N/A[/]")
+        if is_apple:
+            compute_table.add_row("GPU Cores", f"{sm_count}" if sm_count else "[dim]N/A[/]")
+        elif is_amd:
+            compute_table.add_row("Compute Units", f"{sm_count} CUs" if sm_count else "[dim]N/A[/]")
+        else:
+            compute_table.add_row("Multiprocessors", f"{sm_count} SMs" if sm_count else "[dim]N/A[/]")
         compute_table.add_row("Clock Rate", f"{info.get('clock_rate_mhz', 0)} MHz")
         warp = info.get("warp_size")
-        compute_table.add_row("Warp Size", f"{warp} threads" if warp else "[dim]N/A[/]")
+        # Vendor-specific terminology: Apple=SIMD, AMD=Wavefront, NVIDIA=Warp
+        if is_apple:
+            warp_label = "SIMD Width"
+        elif is_amd:
+            warp_label = "Wavefront"
+        else:
+            warp_label = "Warp Size"
+        compute_table.add_row(warp_label, f"{warp} threads" if warp else "[dim]N/A[/]")
         compute_table.add_row("API Version", str(info.get("api_version", 0)))
         coop = info.get("supports_cooperative_launch", False)
         compute_table.add_row("Cooperative", "[green]Supported[/]" if coop else "[dim]No[/]")
@@ -169,6 +185,8 @@ class GPUInfoModal(ModalScreen[None]):
         compute_table.add_row("Device ID", str(info.get("device_id", 0)))
 
         # Top-right: Memory
+        # Apple GPUs use unified memory architecture (shared with system RAM)
+        mem_label = "Unified" if is_apple else "VRAM"
         mem_total = info.get("memory_total", 0)
         mem_free = info.get("memory_free", 0)
         mem_used = mem_total - mem_free
@@ -178,9 +196,9 @@ class GPUInfoModal(ModalScreen[None]):
         memory_table.add_column("Label", style="dim", width=18)
         memory_table.add_column("Value", width=14)
 
-        memory_table.add_row("VRAM Total", _format_bytes(mem_total))
-        memory_table.add_row("VRAM Free", _format_bytes(mem_free))
-        memory_table.add_row("VRAM Used", _format_bytes(mem_used))
+        memory_table.add_row(f"{mem_label} Total", _format_bytes(mem_total))
+        memory_table.add_row(f"{mem_label} Free", _format_bytes(mem_free))
+        memory_table.add_row(f"{mem_label} Used", _format_bytes(mem_used))
         memory_table.add_row("", "")  # spacer
 
         # Memory bar
@@ -190,13 +208,16 @@ class GPUInfoModal(ModalScreen[None]):
         bar_str = f"[{bar_color}]{'█' * filled}[/][dim]{'░' * (bar_width - filled)}[/] {mem_pct:.0f}%"
         memory_table.add_row("", bar_str)
 
+        # Vendor-specific unit label: NVIDIA=SM, AMD=CU, Apple=Core
+        unit_label = "CU" if is_amd else ("Core" if is_apple else "SM")
+
         memory_table.add_row("Shared/Block", _format_bytes(info.get("max_shared_memory_per_block", 0)))
         shared_sm = info.get("max_shared_memory_per_sm")
-        memory_table.add_row("Shared/SM", _format_bytes(shared_sm) if shared_sm else "[dim]N/A[/]")
+        memory_table.add_row(f"Shared/{unit_label}", _format_bytes(shared_sm) if shared_sm else "[dim]N/A[/]")
         regs_block = info.get("max_registers_per_block")
         memory_table.add_row("Registers/Block", str(regs_block) if regs_block else "[dim]N/A[/]")
         regs_sm = info.get("max_registers_per_sm")
-        memory_table.add_row("Registers/SM", str(regs_sm) if regs_sm else "[dim]N/A[/]")
+        memory_table.add_row(f"Registers/{unit_label}", str(regs_sm) if regs_sm else "[dim]N/A[/]")
 
         # Bottom-left: Threads
         threads_table = Table(box=None, show_header=False, padding=(0, 1))
@@ -205,9 +226,9 @@ class GPUInfoModal(ModalScreen[None]):
 
         threads_table.add_row("Max Threads/Block", str(info.get("max_threads_per_block", 0)))
         threads_sm = info.get("max_threads_per_sm")
-        threads_table.add_row("Max Threads/SM", str(threads_sm) if threads_sm else "[dim]N/A[/]")
+        threads_table.add_row(f"Max Threads/{unit_label}", str(threads_sm) if threads_sm else "[dim]N/A[/]")
         blocks_sm = info.get("max_blocks_per_sm")
-        threads_table.add_row("Max Blocks/SM", str(blocks_sm) if blocks_sm else "[dim]N/A[/]")
+        threads_table.add_row(f"Max Blocks/{unit_label}", str(blocks_sm) if blocks_sm else "[dim]N/A[/]")
 
         # Bottom-right: Grid
         grid_table = Table(box=None, show_header=False, padding=(0, 1))
