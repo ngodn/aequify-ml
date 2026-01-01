@@ -277,20 +277,30 @@ struct GPUContext:
         info.__setitem__("api_version", value=self.api_version())
         info.__setitem__("is_compatible", value=self.is_compatible())
 
-        # Compute capability
+        # Compute capability (NVIDIA only, but query returns 0 on others)
         info.__setitem__("compute_capability_major", value=self.compute_capability_major())
         info.__setitem__("compute_capability_minor", value=self.compute_capability_minor())
 
-        # Compute units
-        info.__setitem__("multiprocessor_count", value=self.multiprocessor_count())
+        # Compute units - some not available on Apple GPUs
+        @parameter
+        if not has_apple_gpu_accelerator():
+            info.__setitem__("multiprocessor_count", value=self.multiprocessor_count())
+            info.__setitem__("warp_size", value=self.warp_size())
+            info.__setitem__("max_threads_per_sm", value=self.max_threads_per_multiprocessor())
+            info.__setitem__("max_registers_per_block", value=self.max_registers_per_block())
+            info.__setitem__("max_registers_per_sm", value=self.max_registers_per_multiprocessor())
+
         info.__setitem__("clock_rate_mhz", value=self.clock_rate_mhz())
-        info.__setitem__("warp_size", value=self.warp_size())
         info.__setitem__("supports_cooperative_launch", value=self.supports_cooperative_launch())
 
         # Thread limits
         info.__setitem__("max_threads_per_block", value=self.max_threads_per_block())
-        info.__setitem__("max_threads_per_sm", value=self.max_threads_per_multiprocessor())
-        info.__setitem__("max_blocks_per_sm", value=self.max_blocks_per_multiprocessor())
+
+        # Not available on Apple or AMD GPUs
+        @parameter
+        if not (has_amd_gpu_accelerator() or has_apple_gpu_accelerator()):
+            info.__setitem__("max_blocks_per_sm", value=self.max_blocks_per_multiprocessor())
+            info.__setitem__("max_shared_memory_per_sm", value=self.max_shared_memory_per_multiprocessor())
 
         # Block dimensions
         info.__setitem__("max_block_dim_x", value=self.max_block_dim_x())
@@ -306,9 +316,6 @@ struct GPUContext:
         info.__setitem__("memory_free", value=Int(mem_info[0]))
         info.__setitem__("memory_total", value=Int(mem_info[1]))
         info.__setitem__("max_shared_memory_per_block", value=self.max_shared_memory_per_block())
-        info.__setitem__("max_shared_memory_per_sm", value=self.max_shared_memory_per_multiprocessor())
-        info.__setitem__("max_registers_per_block", value=self.max_registers_per_block())
-        info.__setitem__("max_registers_per_sm", value=self.max_registers_per_multiprocessor())
 
         return info
 

@@ -6,6 +6,7 @@ Starts the engine in a background thread and runs TUI on main thread.
 """
 
 from python import Python, PythonObject
+from sys import has_apple_gpu_accelerator
 from aequify import (
     get_version,
     setup_uvloop,
@@ -67,7 +68,10 @@ fn print_startup_info() raises:
             var gpu = GPUContext()
             print("  Name: " + gpu.device_name())
             print("  Arch: " + gpu.arch_name())
-            print("  SMs: " + String(gpu.multiprocessor_count()))
+            # MULTIPROCESSOR_COUNT not available on Apple GPUs
+            @parameter
+            if not has_apple_gpu_accelerator():
+                print("  SMs: " + String(gpu.multiprocessor_count()))
             print("  Memory: " + String(Int(gpu.total_memory_gb() * 10) / 10.0) + " GB")
         except:
             print("  (could not get GPU info)")

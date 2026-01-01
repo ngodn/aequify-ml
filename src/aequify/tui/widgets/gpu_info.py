@@ -156,9 +156,12 @@ class GPUInfoModal(ModalScreen[None]):
         compute_table.add_column("Label", style="dim", width=18)
         compute_table.add_column("Value", width=14)
 
-        compute_table.add_row("Multiprocessors", f"{info.get('multiprocessor_count', 0)} SMs")
+        # Some fields not available on Apple GPUs
+        sm_count = info.get("multiprocessor_count")
+        compute_table.add_row("Multiprocessors", f"{sm_count} SMs" if sm_count else "[dim]N/A[/]")
         compute_table.add_row("Clock Rate", f"{info.get('clock_rate_mhz', 0)} MHz")
-        compute_table.add_row("Warp Size", f"{info.get('warp_size', 0)} threads")
+        warp = info.get("warp_size")
+        compute_table.add_row("Warp Size", f"{warp} threads" if warp else "[dim]N/A[/]")
         compute_table.add_row("API Version", str(info.get("api_version", 0)))
         coop = info.get("supports_cooperative_launch", False)
         compute_table.add_row("Cooperative", "[green]Supported[/]" if coop else "[dim]No[/]")
@@ -188,9 +191,12 @@ class GPUInfoModal(ModalScreen[None]):
         memory_table.add_row("", bar_str)
 
         memory_table.add_row("Shared/Block", _format_bytes(info.get("max_shared_memory_per_block", 0)))
-        memory_table.add_row("Shared/SM", _format_bytes(info.get("max_shared_memory_per_sm", 0)))
-        memory_table.add_row("Registers/Block", str(info.get("max_registers_per_block", 0)))
-        memory_table.add_row("Registers/SM", str(info.get("max_registers_per_sm", 0)))
+        shared_sm = info.get("max_shared_memory_per_sm")
+        memory_table.add_row("Shared/SM", _format_bytes(shared_sm) if shared_sm else "[dim]N/A[/]")
+        regs_block = info.get("max_registers_per_block")
+        memory_table.add_row("Registers/Block", str(regs_block) if regs_block else "[dim]N/A[/]")
+        regs_sm = info.get("max_registers_per_sm")
+        memory_table.add_row("Registers/SM", str(regs_sm) if regs_sm else "[dim]N/A[/]")
 
         # Bottom-left: Threads
         threads_table = Table(box=None, show_header=False, padding=(0, 1))
@@ -198,8 +204,10 @@ class GPUInfoModal(ModalScreen[None]):
         threads_table.add_column("Value", width=14)
 
         threads_table.add_row("Max Threads/Block", str(info.get("max_threads_per_block", 0)))
-        threads_table.add_row("Max Threads/SM", str(info.get("max_threads_per_sm", 0)))
-        threads_table.add_row("Max Blocks/SM", str(info.get("max_blocks_per_sm", 0)))
+        threads_sm = info.get("max_threads_per_sm")
+        threads_table.add_row("Max Threads/SM", str(threads_sm) if threads_sm else "[dim]N/A[/]")
+        blocks_sm = info.get("max_blocks_per_sm")
+        threads_table.add_row("Max Blocks/SM", str(blocks_sm) if blocks_sm else "[dim]N/A[/]")
 
         # Bottom-right: Grid
         grid_table = Table(box=None, show_header=False, padding=(0, 1))
