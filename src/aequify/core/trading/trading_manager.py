@@ -778,9 +778,11 @@ class TradingManager:
             if not publisher.is_connected:
                 return
 
-            # Publish state with cleared backfill status
+            # Publish state with cleared backfill status only
+            # NOTE: Do NOT reset is_bootstrapped here - this is a partial update
+            # that should only clear backfill progress fields. The TUI handler
+            # will preserve existing bootstrap state when receiving this.
             state = {
-                "is_bootstrapped": False,
                 "source": "bootstrap",
                 "backfill_status": "",
                 "backfill_progress": 0,

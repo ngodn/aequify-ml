@@ -832,9 +832,13 @@ class Aequify(App):
             if not state_data:
                 return
 
+            # Get current state to preserve existing values for partial updates
+            current_state = apex_pane._state
+
             # Convert state dict to APEXTUIState
-            long_params = None
-            short_params = None
+            # Start with existing params (preserve if not provided in update)
+            long_params = current_state.long_params if current_state else None
+            short_params = current_state.short_params if current_state else None
 
             if state_data.get("long_params"):
                 lp = state_data["long_params"]
@@ -866,8 +870,13 @@ class Aequify(App):
                     avg_pnl=sp.get("avg_pnl", 0.0),
                 )
 
+            # Preserve is_bootstrapped if not explicitly provided in update
+            # This allows partial updates (like clearing backfill) to not reset bootstrap state
+            current_is_bootstrapped = current_state.is_bootstrapped if current_state else False
+            is_bootstrapped = state_data.get("is_bootstrapped", current_is_bootstrapped)
+
             tui_state = APEXTUIState(
-                is_bootstrapped=state_data.get("is_bootstrapped", False),
+                is_bootstrapped=is_bootstrapped,
                 source=state_data.get("source", ""),
                 long_params=long_params,
                 short_params=short_params,
