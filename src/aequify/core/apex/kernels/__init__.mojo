@@ -31,7 +31,8 @@ from .grid_search import (
     get_min_gap,
 )
 # from .benchmark import run_benchmarks
-from .bootstrap import PyInit_bootstrap
+# Note: bootstrap is built separately as a shared library, not part of the package
+# from .bootstrap import PyInit_bootstrap
 # from .live_price_move import (
 #     price_move_from_high_cpu,
 #     price_move_from_low_cpu,

@@ -4,24 +4,36 @@ APEX Bootstrap - GPU-accelerated parameter optimization pipeline.
 Full GPU pipeline: numpy → GPU → compute → GPU → numpy
 
 Orchestrates:
-- volume_imbalance: Price-based with session lookback
+- volume_imbalance: Prefix-sum based O(n × buckets) implementation
 - rolling_high/low: O(log n) binary search + SIMD vectorization
 - grid_search_long/short: Warp-per-combo with DCA support
 
 Architecture-adaptive constants for NVIDIA/AMD/Apple GPUs.
 """
 
-from math import ceildiv, log2
-from sys import has_accelerator
+from math import ceildiv
 from time import perf_counter_ns
 
-from gpu import thread_idx, block_idx, block_dim, global_idx, barrier
 from gpu.host import DeviceContext
-from gpu.warp import shuffle_down, WARP_SIZE
-from memory import UnsafePointer, memcpy
+from gpu.globals import WARP_SIZE
+from memory import memcpy, UnsafePointer
 from python import Python, PythonObject
 from python.bindings import PythonModuleBuilder
 from python._cpython import GILReleased
+
+# Import from kernels package (built separately)
+from kernels import (
+    volume_imbalance_gpu,
+    compute_price_range_cpu,
+    rolling_high_gpu,
+    rolling_low_gpu,
+    NO_LOW_SENTINEL,
+    grid_search_long_gpu,
+    grid_search_short_gpu,
+    get_block_size,
+    get_warps_per_block,
+    get_warp_size,
+)
 
 
 # =============================================================================
@@ -58,535 +70,6 @@ comptime SIMD_WIDTH_F32: Int = GPU_SIMD_BIT_WIDTH // 32  # = 4
 
 # Minimum trades needed for statistically valid parameter evaluation
 comptime MIN_ENTRIES_FOR_VALIDITY: Int = 10
-
-# Minimum milliseconds between consecutive entries (5 seconds)
-comptime MIN_GAP: Int = 5000
-
-# Skip first N trades - need enough history for rolling indicators
-comptime START_IDX: Int = 1000
-
-# Sentinel value for "no low found"
-comptime NO_LOW_SENTINEL: Float64 = 1e18
-
-# Session boundaries in UTC hours
-comptime MS_PER_HOUR: Int64 = 3600000
-comptime MS_PER_DAY: Int64 = 86400000
-
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-
-@always_inline
-fn binary_search_lower_bound(
-    timestamps: UnsafePointer[Int64, MutAnyOrigin],
-    start: Int,
-    end: Int,
-    target: Int64,
-) -> Int:
-    """Binary search to find first index where timestamps[idx] >= target."""
-    var lo = start
-    var hi = end
-
-    while lo < hi:
-        var mid = lo + (hi - lo) // 2
-        if timestamps[mid] < target:
-            lo = mid + 1
-        else:
-            hi = mid
-
-    return lo
-
-
-fn get_previous_session_start_ms(current_ts_ms: Int64) -> Int64:
-    """Get the start timestamp of the previous trading session."""
-    var ms_since_midnight = current_ts_ms % MS_PER_DAY
-    var current_hour = Int32(ms_since_midnight // MS_PER_HOUR)
-    var day_start_ms = current_ts_ms - ms_since_midnight
-
-    var prev_session_hour: Int32 = 17
-    var prev_day_offset: Int64 = 0
-
-    if current_hour >= 20:
-        prev_session_hour = 17
-    elif current_hour >= 17:
-        prev_session_hour = 13
-    elif current_hour >= 13:
-        prev_session_hour = 8
-    elif current_hour >= 8:
-        prev_session_hour = 7
-    elif current_hour >= 7:
-        prev_session_hour = 3
-    elif current_hour >= 3:
-        prev_session_hour = 0
-    elif current_hour >= 0:
-        prev_session_hour = 20
-        prev_day_offset = -MS_PER_DAY
-
-    return day_start_ms + prev_day_offset + Int64(prev_session_hour) * MS_PER_HOUR
-
-
-# =============================================================================
-# WARP REDUCTION HELPERS
-# =============================================================================
-
-
-@always_inline
-fn warp_reduce_sum_i32(val: Int32) -> Int32:
-    """Warp-level sum reduction using shuffle."""
-    var result = val
-
-    @parameter
-    if WARP_SIZE == 64:
-        result = result + shuffle_down(result, 32)
-    result = result + shuffle_down(result, 16)
-    result = result + shuffle_down(result, 8)
-    result = result + shuffle_down(result, 4)
-    result = result + shuffle_down(result, 2)
-    result = result + shuffle_down(result, 1)
-    return result
-
-
-@always_inline
-fn warp_reduce_sum_f32(val: Float32) -> Float32:
-    """Warp-level sum reduction using shuffle (Float32)."""
-    var result = val
-
-    @parameter
-    if WARP_SIZE == 64:
-        result = result + shuffle_down(result, 32)
-    result = result + shuffle_down(result, 16)
-    result = result + shuffle_down(result, 8)
-    result = result + shuffle_down(result, 4)
-    result = result + shuffle_down(result, 2)
-    result = result + shuffle_down(result, 1)
-    return result
-
-
-# =============================================================================
-# GPU KERNELS - VOLUME IMBALANCE
-# =============================================================================
-
-
-fn volume_imbalance_kernel(
-    timestamps: UnsafePointer[Int64, MutAnyOrigin],
-    prices: UnsafePointer[Float64, MutAnyOrigin],
-    quantities: UnsafePointer[Float64, MutAnyOrigin],
-    sides: UnsafePointer[Int32, MutAnyOrigin],
-    result: UnsafePointer[Float64, MutAnyOrigin],
-    price_tolerance_pct: Float64,
-    n: Int32,
-):
-    """Compute volume imbalance at price level with session-synchronized lookback."""
-    var i = Int(global_idx.x)
-
-    if i >= Int(n):
-        return
-
-    var current_ts = timestamps[i]
-    var current_price = prices[i]
-    var tolerance = current_price * (price_tolerance_pct / 100.0)
-    var price_low = current_price - tolerance
-    var price_high = current_price + tolerance
-
-    var session_start_ms = get_previous_session_start_ms(current_ts)
-
-    # Binary search for session start
-    var lo = 0
-    var hi = i
-    while lo < hi:
-        var mid = (lo + hi) // 2
-        if timestamps[mid] < session_start_ms:
-            lo = mid + 1
-        else:
-            hi = mid
-    var start_idx = lo
-
-    var buy_sum: Float64 = 0.0
-    var sell_sum: Float64 = 0.0
-
-    var j = start_idx
-    var end_aligned = start_idx + ((i - start_idx) // 2) * 2
-
-    while j < end_aligned:
-        var price0 = prices[j]
-        var price1 = prices[j + 1]
-        var qty0 = quantities[j]
-        var qty1 = quantities[j + 1]
-        var side0 = sides[j]
-        var side1 = sides[j + 1]
-
-        if price0 >= price_low and price0 <= price_high:
-            if side0 == 1:
-                buy_sum += qty0
-            else:
-                sell_sum += qty0
-
-        if price1 >= price_low and price1 <= price_high:
-            if side1 == 1:
-                buy_sum += qty1
-            else:
-                sell_sum += qty1
-
-        j += 2
-
-    while j < i:
-        var price_j = prices[j]
-        if price_j >= price_low and price_j <= price_high:
-            if sides[j] == 1:
-                buy_sum += quantities[j]
-            else:
-                sell_sum += quantities[j]
-        j += 1
-
-    var total = buy_sum + sell_sum
-    if total > 0:
-        result[i] = (buy_sum - sell_sum) / total * 100.0
-    else:
-        result[i] = 0.0
-
-
-# =============================================================================
-# GPU KERNELS - ROLLING EXTREMA
-# =============================================================================
-
-
-fn rolling_high_kernel(
-    timestamps: UnsafePointer[Int64, MutAnyOrigin],
-    prices: UnsafePointer[Float64, MutAnyOrigin],
-    result: UnsafePointer[Float64, MutAnyOrigin],
-    lookback_ms: Int64,
-    n: Int32,
-):
-    """Compute rolling maximum price within time window."""
-    var i = Int(global_idx.x)
-
-    if i >= Int(n):
-        return
-
-    var current_ts = timestamps[i]
-    var cutoff_ts = current_ts - lookback_ms
-
-    var start_idx = binary_search_lower_bound(timestamps, 0, i, cutoff_ts)
-
-    if start_idx >= i:
-        result[i] = 0.0
-        return
-
-    var max_val = prices[start_idx]
-    var window_size = i - start_idx - 1
-
-    var j = start_idx + 1
-    var end_aligned = start_idx + 1 + (window_size // SIMD_WIDTH_F64) * SIMD_WIDTH_F64
-
-    while j < end_aligned:
-        var vec = prices.load[width=SIMD_WIDTH_F64](j)
-        var local_max = vec.reduce_max()
-        if local_max > max_val:
-            max_val = local_max
-        j += SIMD_WIDTH_F64
-
-    while j < i:
-        if prices[j] > max_val:
-            max_val = prices[j]
-        j += 1
-
-    result[i] = max_val
-
-
-fn rolling_low_kernel(
-    timestamps: UnsafePointer[Int64, MutAnyOrigin],
-    prices: UnsafePointer[Float64, MutAnyOrigin],
-    result: UnsafePointer[Float64, MutAnyOrigin],
-    lookback_ms: Int64,
-    n: Int32,
-):
-    """Compute rolling minimum price within time window."""
-    var i = Int(global_idx.x)
-
-    if i >= Int(n):
-        return
-
-    var current_ts = timestamps[i]
-    var cutoff_ts = current_ts - lookback_ms
-
-    var start_idx = binary_search_lower_bound(timestamps, 0, i, cutoff_ts)
-
-    if start_idx >= i:
-        result[i] = NO_LOW_SENTINEL
-        return
-
-    var min_val = prices[start_idx]
-    var window_size = i - start_idx - 1
-
-    var j = start_idx + 1
-    var end_aligned = start_idx + 1 + (window_size // SIMD_WIDTH_F64) * SIMD_WIDTH_F64
-
-    while j < end_aligned:
-        var vec = prices.load[width=SIMD_WIDTH_F64](j)
-        var local_min = vec.reduce_min()
-        if local_min < min_val:
-            min_val = local_min
-        j += SIMD_WIDTH_F64
-
-    while j < i:
-        if prices[j] < min_val:
-            min_val = prices[j]
-        j += 1
-
-    result[i] = min_val
-
-
-# =============================================================================
-# GPU KERNELS - GRID SEARCH LONG (with DCA)
-# =============================================================================
-
-
-fn grid_search_long_kernel(
-    timestamps: UnsafePointer[Int64, MutAnyOrigin],
-    prices: UnsafePointer[Float64, MutAnyOrigin],
-    deltas: UnsafePointer[Float64, MutAnyOrigin],
-    rolling_highs: UnsafePointer[Float64, MutAnyOrigin],
-    param_combos: UnsafePointer[Float64, MutAnyOrigin],
-    out_entries: UnsafePointer[Int32, MutAnyOrigin],
-    out_winners: UnsafePointer[Int32, MutAnyOrigin],
-    out_pnl: UnsafePointer[Float64, MutAnyOrigin],
-    n_combos: Int32,
-    n_windows: Int32,
-    n_prices: Int32,
-    max_scan: Int32,
-    outer_stride: Int32,
-):
-    """
-    LONG grid search with DCA: price drops + selling pressure → buy expecting bounce.
-
-    Param format: [pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist].
-    """
-    var warp_id = Int(thread_idx.x) // Int(WARP_SIZE)
-    var lane_id = Int(thread_idx.x) % Int(WARP_SIZE)
-
-    var combo_idx = Int(block_idx.x) * WARPS_PER_BLOCK + warp_id
-    if combo_idx >= Int(n_combos):
-        return
-
-    # Extract parameters (9 params per combo)
-    var param_offset = combo_idx * 9
-    var pm = param_combos[param_offset + 0]
-    var window_idx = Int(param_combos[param_offset + 1])
-    var dt = param_combos[param_offset + 2]
-    var target_pct = param_combos[param_offset + 3]
-    var stop_pct = param_combos[param_offset + 4]
-    var max_hold_ms = Int64(Int(param_combos[param_offset + 5]))
-    var dca_mult = param_combos[param_offset + 6]
-    var max_pos_mult = param_combos[param_offset + 7]
-    var dca_dist = param_combos[param_offset + 8]
-
-    var local_entries: Int32 = 0
-    var local_winners: Int32 = 0
-    var local_pnl: Float32 = 0.0
-    var last_entry_ts: Int64 = 0
-
-    var i = START_IDX + lane_id * Int(outer_stride)
-    while i < Int(n_prices):
-        if timestamps[i] - last_entry_ts >= MIN_GAP:
-            var high = rolling_highs[window_idx * Int(n_prices) + i]
-
-            if high > 0:
-                var drop = (prices[i] - high) / high * 100.0
-
-                if drop <= pm and deltas[i] <= dt:
-                    var entry_px = prices[i]
-                    var entry_ts = timestamps[i]
-                    var max_ts = entry_ts + max_hold_ms
-
-                    var avg_entry = entry_px
-                    var pos_size: Float64 = 1.0
-                    var sl_active = False
-
-                    var exit_px = entry_px
-                    var won: Int32 = 0
-                    var exited = False
-
-                    var scan_end = min(Int(n_prices), i + Int(max_scan))
-                    for j in range(i + 1, scan_end):
-                        var current_px = prices[j]
-                        var current_ts = timestamps[j]
-
-                        if current_ts > max_ts:
-                            exit_px = current_px
-                            exited = True
-                            break
-
-                        var move_from_avg = (current_px - avg_entry) / avg_entry * 100.0
-
-                        if not sl_active and move_from_avg <= dca_dist:
-                            var new_size = pos_size * dca_mult
-                            if pos_size + new_size <= max_pos_mult:
-                                avg_entry = (avg_entry * pos_size + current_px * new_size) / (pos_size + new_size)
-                                pos_size += new_size
-                            else:
-                                sl_active = True
-
-                        var target_px = avg_entry * (1.0 + target_pct / 100.0)
-                        var stop_px = avg_entry * (1.0 + stop_pct / 100.0)
-
-                        if current_px >= target_px:
-                            exit_px = current_px
-                            won = 1
-                            exited = True
-                            break
-
-                        if sl_active and current_px <= stop_px:
-                            exit_px = current_px
-                            exited = True
-                            break
-
-                    if not exited:
-                        exit_px = prices[min(scan_end - 1, Int(n_prices) - 1)]
-
-                    var pnl = Float32((exit_px - avg_entry) / avg_entry * 100.0 * pos_size)
-
-                    local_entries += 1
-                    local_winners += won
-                    local_pnl += pnl
-                    last_entry_ts = timestamps[i]
-
-        i += Int(WARP_SIZE) * Int(outer_stride)
-
-    var total_entries = warp_reduce_sum_i32(local_entries)
-    var total_winners = warp_reduce_sum_i32(local_winners)
-    var total_pnl = warp_reduce_sum_f32(local_pnl)
-
-    if lane_id == 0:
-        out_entries[combo_idx] = total_entries
-        out_winners[combo_idx] = total_winners
-        out_pnl[combo_idx] = Float64(total_pnl)
-
-
-# =============================================================================
-# GPU KERNELS - GRID SEARCH SHORT (with DCA)
-# =============================================================================
-
-
-fn grid_search_short_kernel(
-    timestamps: UnsafePointer[Int64, MutAnyOrigin],
-    prices: UnsafePointer[Float64, MutAnyOrigin],
-    deltas: UnsafePointer[Float64, MutAnyOrigin],
-    rolling_lows: UnsafePointer[Float64, MutAnyOrigin],
-    param_combos: UnsafePointer[Float64, MutAnyOrigin],
-    out_entries: UnsafePointer[Int32, MutAnyOrigin],
-    out_winners: UnsafePointer[Int32, MutAnyOrigin],
-    out_pnl: UnsafePointer[Float64, MutAnyOrigin],
-    n_combos: Int32,
-    n_windows: Int32,
-    n_prices: Int32,
-    max_scan: Int32,
-    outer_stride: Int32,
-):
-    """
-    SHORT grid search with DCA: price rises + buying pressure → sell expecting drop.
-
-    Param format: [pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist].
-    """
-    var warp_id = Int(thread_idx.x) // Int(WARP_SIZE)
-    var lane_id = Int(thread_idx.x) % Int(WARP_SIZE)
-
-    var combo_idx = Int(block_idx.x) * WARPS_PER_BLOCK + warp_id
-    if combo_idx >= Int(n_combos):
-        return
-
-    var param_offset = combo_idx * 9
-    var pm = param_combos[param_offset + 0]
-    var window_idx = Int(param_combos[param_offset + 1])
-    var dt = param_combos[param_offset + 2]
-    var target_pct = param_combos[param_offset + 3]
-    var stop_pct = param_combos[param_offset + 4]
-    var max_hold_ms = Int64(Int(param_combos[param_offset + 5]))
-    var dca_mult = param_combos[param_offset + 6]
-    var max_pos_mult = param_combos[param_offset + 7]
-    var dca_dist = param_combos[param_offset + 8]
-
-    var local_entries: Int32 = 0
-    var local_winners: Int32 = 0
-    var local_pnl: Float32 = 0.0
-    var last_entry_ts: Int64 = 0
-
-    var i = START_IDX + lane_id * Int(outer_stride)
-    while i < Int(n_prices):
-        if timestamps[i] - last_entry_ts >= MIN_GAP:
-            var low = rolling_lows[window_idx * Int(n_prices) + i]
-
-            if low > 0 and low < NO_LOW_SENTINEL:
-                var rise = (prices[i] - low) / low * 100.0
-
-                if rise >= pm and deltas[i] >= dt:
-                    var entry_px = prices[i]
-                    var entry_ts = timestamps[i]
-                    var max_ts = entry_ts + max_hold_ms
-
-                    var avg_entry = entry_px
-                    var pos_size: Float64 = 1.0
-                    var sl_active = False
-
-                    var exit_px = entry_px
-                    var won: Int32 = 0
-                    var exited = False
-
-                    var scan_end = min(Int(n_prices), i + Int(max_scan))
-                    for j in range(i + 1, scan_end):
-                        var current_px = prices[j]
-                        var current_ts = timestamps[j]
-
-                        if current_ts > max_ts:
-                            exit_px = current_px
-                            exited = True
-                            break
-
-                        var move_from_avg = (current_px - avg_entry) / avg_entry * 100.0
-
-                        if not sl_active and move_from_avg >= dca_dist:
-                            var new_size = pos_size * dca_mult
-                            if pos_size + new_size <= max_pos_mult:
-                                avg_entry = (avg_entry * pos_size + current_px * new_size) / (pos_size + new_size)
-                                pos_size += new_size
-                            else:
-                                sl_active = True
-
-                        var target_px = avg_entry * (1.0 - target_pct / 100.0)
-                        var stop_px = avg_entry * (1.0 - stop_pct / 100.0)
-
-                        if current_px <= target_px:
-                            exit_px = current_px
-                            won = 1
-                            exited = True
-                            break
-
-                        if sl_active and current_px >= stop_px:
-                            exit_px = current_px
-                            exited = True
-                            break
-
-                    if not exited:
-                        exit_px = prices[min(scan_end - 1, Int(n_prices) - 1)]
-
-                    var pnl = Float32((avg_entry - exit_px) / avg_entry * 100.0 * pos_size)
-
-                    local_entries += 1
-                    local_winners += won
-                    local_pnl += pnl
-                    last_entry_ts = timestamps[i]
-
-        i += Int(WARP_SIZE) * Int(outer_stride)
-
-    var total_entries = warp_reduce_sum_i32(local_entries)
-    var total_winners = warp_reduce_sum_i32(local_winners)
-    var total_pnl = warp_reduce_sum_f32(local_pnl)
-
-    if lane_id == 0:
-        out_entries[combo_idx] = total_entries
-        out_winners[combo_idx] = total_winners
-        out_pnl[combo_idx] = Float64(total_pnl)
 
 
 # =============================================================================
@@ -685,7 +168,11 @@ fn bootstrap_internal(
     """
     Full GPU-accelerated bootstrap pipeline.
 
-    ALL computation runs on GPU. Only data transfer uses CPU.
+    Uses optimized GPU kernels from kernel modules:
+    - volume_imbalance_gpu: O(n × buckets) prefix-sum based
+    - rolling_high_gpu / rolling_low_gpu: O(n × window) with SIMD
+    - grid_search_long_gpu / grid_search_short_gpu: Warp-per-combo with DCA
+
     GIL is released during GPU operations to allow other Python threads to run.
     """
     var py = Python()
@@ -718,6 +205,10 @@ fn bootstrap_internal(
     var windows = List[Int64]()
     for w_idx in range(n_windows):
         windows.append(Int64(Int(time_windows_ms[w_idx])))
+
+    # Compute price range for volume_imbalance_gpu (needs min/max price)
+    var min_price = Float64(np.min(px_arr))
+    var max_price = Float64(np.max(px_arr))
 
     # Pre-allocate output numpy arrays (need GIL for this)
     var long_entries = np.zeros(n_long, dtype=np.int32)
@@ -812,22 +303,26 @@ fn bootstrap_internal(
         ctx.enqueue_copy(dst_buf=long_params_dev, src_buf=long_params_host)
         ctx.enqueue_copy(dst_buf=short_params_dev, src_buf=short_params_host)
 
+        ctx.synchronize()
+
         # ---------------------------------------------------------------------
-        # STEP 3: Compute volume imbalance on GPU
+        # STEP 3: Compute volume imbalance on GPU (optimized prefix-sum version)
         # ---------------------------------------------------------------------
         var imbalance_dev = ctx.enqueue_create_buffer[DType.float64](n)
-        var imbalance_blocks = ceildiv(n, BLOCK_SIZE)
 
-        ctx.enqueue_function_checked[volume_imbalance_kernel, volume_imbalance_kernel](
-            ts_dev.unsafe_ptr(),
-            px_dev.unsafe_ptr(),
-            qty_dev.unsafe_ptr(),
-            sd_dev.unsafe_ptr(),
-            imbalance_dev.unsafe_ptr(),
+        volume_imbalance_gpu(
+            ctx,
+            ts_dev,
+            px_dev,
+            qty_dev,
+            sd_dev,
+            imbalance_dev,
+            min_price,
+            max_price,
             imbalance_price_tolerance_pct,
-            Int32(n),
-            grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
+            n,
         )
+        ctx.synchronize()
 
         # ---------------------------------------------------------------------
         # STEP 4: Compute rolling highs/lows on GPU
@@ -838,25 +333,40 @@ fn bootstrap_internal(
 
         for w_idx in range(n_windows):
             var window_ms = windows[w_idx]
+
+            # Create sub-buffers for this window's results
+            # Note: We need to create separate buffers and copy, or use offset
+            # For simplicity, we'll create temp buffers and copy
+            var rh_window_dev = ctx.enqueue_create_buffer[DType.float64](n)
+            var rl_window_dev = ctx.enqueue_create_buffer[DType.float64](n)
+
+            rolling_high_gpu(ctx, ts_dev, px_dev, rh_window_dev, window_ms, n)
+            rolling_low_gpu(ctx, ts_dev, px_dev, rl_window_dev, window_ms, n)
+
+            # Copy to the correct offset in the combined buffer
             var offset = w_idx * n
+            var rh_host_temp = ctx.enqueue_create_host_buffer[DType.float64](n)
+            var rl_host_temp = ctx.enqueue_create_host_buffer[DType.float64](n)
+            ctx.enqueue_copy(dst_buf=rh_host_temp, src_buf=rh_window_dev)
+            ctx.enqueue_copy(dst_buf=rl_host_temp, src_buf=rl_window_dev)
+            ctx.synchronize()
 
-            ctx.enqueue_function_checked[rolling_high_kernel, rolling_high_kernel](
-                ts_dev.unsafe_ptr(),
-                px_dev.unsafe_ptr(),
-                rh_dev.unsafe_ptr().offset(offset),
-                window_ms,
-                Int32(n),
-                grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
+            # Copy to combined buffer at offset
+            memcpy(
+                dest=rh_dev.unsafe_ptr().offset(offset).bitcast[UInt8](),
+                src=rh_host_temp.unsafe_ptr().bitcast[UInt8](),
+                count=n * 8,
+            )
+            memcpy(
+                dest=rl_dev.unsafe_ptr().offset(offset).bitcast[UInt8](),
+                src=rl_host_temp.unsafe_ptr().bitcast[UInt8](),
+                count=n * 8,
             )
 
-            ctx.enqueue_function_checked[rolling_low_kernel, rolling_low_kernel](
-                ts_dev.unsafe_ptr(),
-                px_dev.unsafe_ptr(),
-                rl_dev.unsafe_ptr().offset(offset),
-                window_ms,
-                Int32(n),
-                grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
-            )
+            _ = rh_window_dev^
+            _ = rl_window_dev^
+            _ = rh_host_temp^
+            _ = rl_host_temp^
 
         ctx.synchronize()
 
@@ -869,18 +379,21 @@ fn bootstrap_internal(
         var long_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_long)
         var long_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_long)
 
-        var long_blocks = ceildiv(n_long, WARPS_PER_BLOCK)
-        ctx.enqueue_function_checked[grid_search_long_kernel, grid_search_long_kernel](
-            ts_dev.unsafe_ptr(),
-            px_dev.unsafe_ptr(),
-            imbalance_dev.unsafe_ptr(),
-            rh_dev.unsafe_ptr(),
-            long_params_dev.unsafe_ptr(),
-            long_entries_dev.unsafe_ptr(),
-            long_winners_dev.unsafe_ptr(),
-            long_pnl_dev.unsafe_ptr(),
-            Int32(n_long), Int32(n_windows), Int32(n), Int32(max_scan), Int32(outer_stride),
-            grid_dim=long_blocks, block_dim=BLOCK_SIZE
+        grid_search_long_gpu(
+            ctx,
+            ts_dev,
+            px_dev,
+            imbalance_dev,
+            rh_dev,
+            long_params_dev,
+            long_entries_dev,
+            long_winners_dev,
+            long_pnl_dev,
+            n_long,
+            n_windows,
+            n,
+            max_scan,
+            outer_stride,
         )
         ctx.synchronize()
 
@@ -921,18 +434,21 @@ fn bootstrap_internal(
         var short_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_short)
         var short_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_short)
 
-        var short_blocks = ceildiv(n_short, WARPS_PER_BLOCK)
-        ctx.enqueue_function_checked[grid_search_short_kernel, grid_search_short_kernel](
-            ts_dev.unsafe_ptr(),
-            px_dev.unsafe_ptr(),
-            imbalance_dev.unsafe_ptr(),
-            rl_dev.unsafe_ptr(),
-            short_params_dev.unsafe_ptr(),
-            short_entries_dev.unsafe_ptr(),
-            short_winners_dev.unsafe_ptr(),
-            short_pnl_dev.unsafe_ptr(),
-            Int32(n_short), Int32(n_windows), Int32(n), Int32(max_scan), Int32(outer_stride),
-            grid_dim=short_blocks, block_dim=BLOCK_SIZE
+        grid_search_short_gpu(
+            ctx,
+            ts_dev,
+            px_dev,
+            imbalance_dev,
+            rl_dev,
+            short_params_dev,
+            short_entries_dev,
+            short_winners_dev,
+            short_pnl_dev,
+            n_short,
+            n_windows,
+            n,
+            max_scan,
+            outer_stride,
         )
         ctx.synchronize()
 

@@ -65,6 +65,8 @@ _mojo_get_gpu_info = None
 _mojo_import_error: str | None = None
 
 try:
+    import importlib.util
+
     import mojo.importer  # noqa: F401
 
     # Add paths for mojo imports
@@ -81,8 +83,22 @@ try:
     _mojo_get_gpu_info = apex_gpu.get_all_info
     _GPU_AVAILABLE = apex_gpu.gpu_available()
 
-    # Import bootstrap kernel (from src/aequify/core/apex/kernels/bootstrap.mojo)
-    from bootstrap import bootstrap as _mojo_bootstrap  # type: ignore[import-not-found]
+    # Load pre-built bootstrap shared library
+    # Built via: mise run kernels:build (or automatically via mise run aequify)
+    _bootstrap_so_path = _kernels_dir / "__mojocache__" / "bootstrap.so"
+    if not _bootstrap_so_path.exists():
+        raise ImportError(
+            f"Bootstrap kernel not found at {_bootstrap_so_path}. "
+            "Run 'mise run kernels:build' to compile the GPU kernels."
+        )
+
+    # Load the .so as a Python extension module
+    spec = importlib.util.spec_from_file_location("bootstrap", str(_bootstrap_so_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load bootstrap from {_bootstrap_so_path}")
+    _bootstrap_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_bootstrap_module)
+    _mojo_bootstrap = _bootstrap_module.bootstrap
 
     _MOJO_AVAILABLE = True
 
