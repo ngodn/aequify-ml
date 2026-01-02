@@ -345,7 +345,7 @@ class ColdStore:
             Tuple of (min_timestamp_ms, max_timestamp_ms) or None if no trades.
         """
         sql = f"""
-            SELECT MIN(timestamp_ms) as min_ts, MAX(timestamp_ms) as max_ts
+            SELECT MIN(timestamp) as min_ts, MAX(timestamp) as max_ts
             FROM {self.TABLE_TRADES}
             WHERE symbol = $1
         """
