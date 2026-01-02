@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aequify.logging import get_logger
+from aequify.runtime import run_async_fire_and_forget
 
 logger = get_logger(__name__)
 
@@ -192,20 +193,16 @@ class BinanceFuturesRateLimiter:
         """
         Notify callbacks synchronously.
 
-        For async callbacks, schedules them as tasks if there's a running loop.
+        For async callbacks, uses the aequify runtime to schedule them
+        in the main event loop (fire-and-forget pattern).
         """
         state = self.state
         for callback in self._callbacks:
             try:
                 result = callback(state)
                 if asyncio.iscoroutine(result):
-                    # Try to schedule in running loop
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(result)
-                    except RuntimeError:
-                        # No running loop, skip async callback
-                        pass
+                    # Schedule async callback in the runtime's main loop
+                    run_async_fire_and_forget(result)
             except Exception as e:
                 logger.error(f"Rate limit callback error: {e}")
 

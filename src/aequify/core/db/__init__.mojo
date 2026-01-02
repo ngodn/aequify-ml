@@ -1,4 +1,3 @@
 """Database module - Hot storage for trade data."""
 
-from .models import Trade, WindowIndices
-from .hot import HotStore
+from .hot import Trade, WindowIndices, HotStore, PyInit_hot

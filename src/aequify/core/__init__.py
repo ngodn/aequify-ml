@@ -11,7 +11,6 @@ Optimized for Python 3.14+ free-threaded builds.
 
 from .exchange import BinanceFuturesRateLimiter, RateLimitState
 from aequify.logging import get_logger, setup_logging, shutdown_logging
-from .ports import PUBSUB_PORT
 from .pubsub import PubSubMessage, PubSubServer, Subscriber, SubscriberWorker
 from .system import SystemMonitor, SystemStats
 
@@ -23,8 +22,6 @@ __all__ = [
     "get_logger",
     "setup_logging",
     "shutdown_logging",
-    # Ports
-    "PUBSUB_PORT",
     # PubSub
     "PubSubServer",
     "PubSubMessage",

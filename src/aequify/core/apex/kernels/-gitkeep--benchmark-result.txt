@@ -1,0 +1,159 @@
+aequify-ml senpai  ? ❯ uv run mojo -I src src/benchmark.mojo
+      Built aequify @ file:///home/eins0fx/development/aequify/aequify-ml
+Uninstalled 1 package in 0.34ms
+Installed 1 package in 0.39ms
+============================================================
+APEX Kernel Benchmark
+============================================================
+
+GPU Available: True
+
+------------------------------------------------------------
+Loading Data
+------------------------------------------------------------
+Loading CSV: /home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT/LIGHTUSDT-aggTrades-2025-10-06.csv
+  Loaded 547248 trades
+Loading CSV: /home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT/LIGHTUSDT-aggTrades-2025-10-07.csv
+  Loaded 915006 trades
+Loading CSV: /home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT/LIGHTUSDT-aggTrades-2025-10-08.csv
+  Loaded 452018 trades
+Loading CSV: /home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT/LIGHTUSDT-aggTrades-2025-10-09.csv
+  Loaded 349432 trades
+Loading CSV: /home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT/LIGHTUSDT-aggTrades-2025-10-10.csv
+  Loaded 245309 trades
+Loading CSV: /home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT/LIGHTUSDT-aggTrades-2025-10-11.csv
+  Loaded 243885 trades
+Loading CSV: /home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT/LIGHTUSDT-aggTrades-2025-10-12.csv
+  Loaded 156417 trades
+
+Total trades loaded: 2909315
+
+Data size: 2909315 trades (7 days)
+Price range: 0.78004 - 1.1022
+Lookback windows: 15m, 30m, 45m, 1h, 4h
+Volume imbalance naive tolerance: 0.1%
+Volume imbalance optimized tolerance: 2.5%
+
+Optimized kernel memory config:
+  Buckets: 200
+  Memory required: 8.778814785182476 GB
+  Available VRAM: 9.55499267578125 GB
+  Max trades for VRAM: 2691560
+  Fits in VRAM: False
+
+============================================================
+CPU BENCHMARKS -- SKIPPED, RESULTS SHOW IT'S TOO SLOW
+============================================================
+
+============================================================
+VOLUME IMBALANCE CPU BENCHMARKS - SKIPPED, RESULTS SHOW IT'S TOO SLOW
+============================================================
+
+============================================================
+GPU BENCHMARKS
+============================================================
+
+GPU: NVIDIA GeForce RTX 3060
+
+Uploading data to GPU...
+  Upload time: 3.349038 ms
+
+--- Lookback: 15m ---
+
+--- Rolling High (GPU) ---
+  Average time: 339.208397 ms
+  Throughput: 8576777.655654557 elements/sec
+
+--- Rolling Low (GPU) ---
+  Average time: 339.335446 ms
+  Throughput: 8573566.464376964 elements/sec
+
+  Summary:
+    Rolling High: 339.208397 ms
+    Rolling Low:  339.335446 ms
+
+--- Lookback: 30m ---
+
+--- Rolling High (GPU) ---
+  Average time: 636.94949 ms
+  Throughput: 4567575.680137525 elements/sec
+
+--- Rolling Low (GPU) ---
+  Average time: 637.690585 ms
+  Throughput: 4562267.451384749 elements/sec
+
+  Summary:
+    Rolling High: 636.94949 ms
+    Rolling Low:  637.690585 ms
+
+--- Lookback: 45m ---
+
+--- Rolling High (GPU) ---
+  Average time: 916.418376 ms
+  Throughput: 3174658.0777860787 elements/sec
+
+--- Rolling Low (GPU) ---
+  Average time: 916.308118 ms
+  Throughput: 3175040.079695114 elements/sec
+
+  Summary:
+    Rolling High: 916.418376 ms
+    Rolling Low:  916.308118 ms
+
+--- Lookback: 1h ---
+
+--- Rolling High (GPU) ---
+  Average time: 1.18471182 s
+  Throughput: 2455715.348564683 elements/sec
+
+--- Rolling Low (GPU) ---
+  Average time: 1.190580541 s
+  Throughput: 2443610.4066982223 elements/sec
+
+  Summary:
+    Rolling High: 1.18471182 s
+    Rolling Low:  1.190580541 s
+
+--- Lookback: 4h ---
+
+--- Rolling High (GPU) ---
+  Average time: 4.064334628 s
+  Throughput: 715815.8139728843 elements/sec
+
+--- Rolling Low (GPU) ---
+  Average time: 4.049600818 s
+  Throughput: 718420.1926936691 elements/sec
+
+  Summary:
+    Rolling High: 4.064334628 s
+    Rolling Low:  4.049600818 s
+
+------------------------------------------------------------
+VOLUME IMBALANCE GPU BENCHMARK
+------------------------------------------------------------
+
+--- Volume Imbalance (GPU) ---
+  Average time: 18.455344888 s
+  Throughput: 157640.78198786138 elements/sec
+
+  Summary:
+    Volume Imbalance GPU (naive): 18.455344888 s
+
+------------------------------------------------------------
+VOLUME IMBALANCE OPTIMIZED GPU BENCHMARK (Prefix Sum)
+------------------------------------------------------------
+
+--- Volume Imbalance OPTIMIZED (GPU) ---
+  Buckets: 200 (tolerance: 2.5%)
+  Average time: 1.519965668 s
+  Throughput: 1914066.2590281612 elements/sec
+
+  Summary:
+    Volume Imbalance GPU (optimized): 1.519965668 s
+
+  Naive vs Optimized Speedup:
+    Naive: 18.455344888 s -> Optimized: 1.519965668 s (12.141948516695049x faster)
+
+============================================================
+Benchmark Complete
+============================================================

@@ -255,6 +255,27 @@ def setup_logging(
         # Register cleanup at exit
         atexit.register(shutdown_logging)
 
+        # Suppress noisy third-party loggers
+        for name in [
+            "ccxt",
+            "httpx",
+            "httpcore",
+            "websockets",
+            "asyncio",
+            "watchfiles",
+            "numba",
+            "numba.core",
+        ]:
+            noisy = logging.getLogger(name)
+            noisy.setLevel(logging.CRITICAL)
+            noisy.propagate = False
+
+        # CUDA driver errors should be visible at ERROR level (OOM, device errors, etc.)
+        for name in ["numba.cuda", "numba.cuda.cudadrv", "numba.cuda.cudadrv.driver"]:
+            cuda_logger = logging.getLogger(name)
+            cuda_logger.setLevel(logging.ERROR)
+            cuda_logger.propagate = False
+
         _is_setup = True
 
         # Log startup

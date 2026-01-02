@@ -4,13 +4,10 @@ Aequify PubSub - Topic-based publish/subscribe over sockets.
 Provides real-time message delivery for decoupled components.
 Built on top of aequify.sockets for reliable communication.
 
-Port: Uses PUBSUB_PORT (9300) from aequify.core.ports.
-See aequify/core/ports.py for port allocation rules.
+Port: Default is 9901, configurable via config.yaml pubsub.port.
 
 Example Publisher (Engine):
-    from aequify.core.ports import PUBSUB_PORT
-
-    server = PubSubServer("127.0.0.1", PUBSUB_PORT)
+    server = PubSubServer("127.0.0.1", 9901)
     server.start_background()
 
     # Publish state changes
@@ -18,9 +15,7 @@ Example Publisher (Engine):
     server.publish("rate_limit", {"weight": 1200, "limit": 2400})
 
 Example Subscriber (TUI):
-    from aequify.core.ports import PUBSUB_PORT
-
-    subscriber = Subscriber("127.0.0.1", PUBSUB_PORT, topics=["engine.state"])
+    subscriber = Subscriber("127.0.0.1", 9901, topics=["engine.state"])
     subscriber.connect()
 
     # Receive messages
@@ -39,7 +34,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aequify.logging import get_logger
-from aequify.core.ports import PUBSUB_PORT
 from aequify.sockets import (
     CallbackHandler,
     ClientConnection,
@@ -90,9 +84,7 @@ class PubSubServer:
     - Thread-safe publishing
 
     Example:
-        from aequify.core.ports import PUBSUB_PORT
-
-        server = PubSubServer("0.0.0.0", PUBSUB_PORT)
+        server = PubSubServer("0.0.0.0", 9901)
         server.start_background()
 
         server.publish("engine.state", {"tick": 1, "status": "running"})
@@ -104,7 +96,7 @@ class PubSubServer:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = PUBSUB_PORT,
+        port: int = 9901,
         thread_name_prefix: str = "pubsub",
     ) -> None:
         """
@@ -112,7 +104,7 @@ class PubSubServer:
 
         Args:
             host: Host address to bind to.
-            port: Port number to bind to (default: PUBSUB_PORT from ports.py).
+            port: Port number to bind to (default: 9901, configurable via config.yaml).
             thread_name_prefix: Prefix for thread names.
         """
         self._host = host
@@ -270,9 +262,7 @@ class Subscriber:
     Connects to a PubSubServer and receives messages filtered by topic.
 
     Example:
-        from aequify.core.ports import PUBSUB_PORT
-
-        subscriber = Subscriber("127.0.0.1", PUBSUB_PORT)
+        subscriber = Subscriber("127.0.0.1", 9901)
         subscriber.connect()
         subscriber.subscribe(["engine.state", "rate_limit"])
 
@@ -285,7 +275,7 @@ class Subscriber:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = PUBSUB_PORT,
+        port: int = 9901,
         topics: list[str] | None = None,
         auto_reconnect: bool = True,
     ) -> None:
@@ -294,7 +284,7 @@ class Subscriber:
 
         Args:
             host: Server host address.
-            port: Server port number (default: PUBSUB_PORT from ports.py).
+            port: Server port number (default: 9901, configurable via config.yaml).
             topics: Topics to subscribe to (None = all).
             auto_reconnect: Enable automatic reconnection.
         """
@@ -426,12 +416,10 @@ class SubscriberWorker:
     Useful for integrating with event loops or UI frameworks.
 
     Example:
-        from aequify.core.ports import PUBSUB_PORT
-
         def handle_message(msg: PubSubMessage):
             print(f"{msg.topic}: {msg.data}")
 
-        worker = SubscriberWorker("127.0.0.1", PUBSUB_PORT, handler=handle_message)
+        worker = SubscriberWorker("127.0.0.1", 9901, handler=handle_message)
         worker.start()  # Runs in background thread
 
         # Later
@@ -441,7 +429,7 @@ class SubscriberWorker:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = PUBSUB_PORT,
+        port: int = 9901,
         handler: MessageHandler | None = None,
         topics: list[str] | None = None,
     ) -> None:
@@ -450,7 +438,7 @@ class SubscriberWorker:
 
         Args:
             host: Server host address.
-            port: Server port number (default: PUBSUB_PORT from ports.py).
+            port: Server port number (default: 9901, configurable via config.yaml).
             handler: Callback for received messages.
             topics: Topics to subscribe to.
         """

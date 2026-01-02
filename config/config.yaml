@@ -1,22 +1,24 @@
 trading:
-  enabled: true
-  mode: demo
+  mode: live
+  position_poll_delay: 60
+  order_reconciliation_interval: 90
   disable_trading_on_window_utc:
     - - 2320
       - 2321
   risk:
     max_positions: 20
-    max_daily_loss_pct: 5.0
   futures:
     margin_mode: CROSS
     leverage: 10
     long:
       enabled: true
       initial_entry_size_usdt: 6.25
+      dca_multiplier: 4.25
       maximum_position_size_usdt: 180.0
     short:
       enabled: true
       initial_entry_size_usdt: 6.25
+      dca_multiplier: 4.25
       maximum_position_size_usdt: 180.0
 filters:
   - name: absolute_price_percentage_change
@@ -29,37 +31,29 @@ filters:
       pair: USDT
       blacklist:
         - 币安人生 # Chinese chars - causes encoding issues
-        - BAS
+        - BTC
         - ETH
-        - FIS
-        - MILK
-        - TOKEN
+        - ADA
+        - XRP
       whitelist: []
 engines:
   apex:
-    processing: GPU
-    min_warm_duration_hours: 4.0
-    max_warm_age_hours: 2016.0
-    max_cache_valid_days: 7.0 # If cache < 7 days old, skip backfill + GPU entirely
-    min_entries_for_validity: 5
-    # Volume imbalance: price-based (footprint/order flow style)
-    # Measures buy/sell imbalance at trades within X% of current price
-    imbalance_price_tolerance_pct: 1.0  # 1% price range for imbalance calculation
     bootstrap:
+      min_lookback_days: 7.0
+      trades_lookback_days: 90.0
       max_trades: 10000000
-      # Lookback windows for rolling high/low price detection
-      lookback_windows_ms:
-        - 900000 # 15 minutes
-        - 1800000 # 30 minutes
-        - 2700000 # 45 minutes
-        - 3600000 # 1 hour
-        - 14400000 # 4 hours
-      # Position exit parameters
+      max_cache_valid_days: 7.0
+      rolling_kernel:
+        lookback_windows_ms:
+          - 900000
+          - 14400000
+      volume_imbalance_kernel:
+        price_tolerance_pct: 2.5
       position:
         target_profit_pct:
           min: 1.75
-          max: 3.75
-          step: 1.0
+          max: 5.75
+          step: 2.0
           default: 1.5
         stop_loss_pct:
           min: -3.0
@@ -68,37 +62,35 @@ engines:
           default: -1.0
         max_hold_time_ms:
           min: 900000
-          max: 3600000
-          step: 900000
-          default: 60000
-      # LONG signal: Price DROPS + SELLING pressure -> BUY expecting bounce
+          max: 14400000
+          step: 3600000
+          default: 900000
       long:
         signal_offset: 0.25
-        price_move_pct: # How much price must DROP from rolling high
-          min: -10.75
-          max: -2.75
-          step: 2.0
+        price_move_pct:
+          min: -7.75
+          max: -1.75
+          step: 1.0
           default: -3.5
-        volume_delta_threshold: # Selling pressure (negative = more sells)
+        volume_imbalance_threshold:
           min: -90
-          max: -60
+          max: -70
           step: 10
           default: -50
         dca_distance_pct:
-          min: -10.75
-          max: -2.75
+          min: -9.75
+          max: -3.75
           step: 2.0
           default: -3.5
-      # SHORT signal: Price RISES + BUYING pressure -> SELL expecting drop
       short:
         signal_offset: 0.25
-        price_move_pct: # How much price must RISE from rolling low
-          min: 10.0
-          max: 40.0
-          step: 10.0
+        price_move_pct:
+          min: 5.0
+          max: 20.0
+          step: 5.0
           default: 7.0
-        volume_delta_threshold: # Buying pressure (positive = more buys)
-          min: 60
+        volume_imbalance_threshold:
+          min: 70
           max: 90
           step: 10
           default: 50
@@ -107,29 +99,25 @@ engines:
           max: 40.0
           step: 10.0
           default: 7.0
-
+    live:
+      lookback_windows_ms: 14400000
 database:
-  hot:
-    duration_days: 30
-    trades_per_second: 60
-    safety_margin: 1.1
-  warm:
-    enabled: true
+  hot: 
+    flush_window_ms: 900000
+  cold:
     host: localhost
-    port: 9000
-    table: trades
-  flush:
-    interval_seconds: 60
-    min_trades: 100
-rtds:
-  exchange: binanceusdm
-  demo: false
-  max_retries: 0
-  position_poll_delay: 60
-  order_reconciliation_interval: 90
-  symbols: []
+    ilp_port: 9009
+    pg_port: 8812
+    pg_user: admin
+    pg_password: quest
+    pg_database: qdb
+    pool_min_size: 2
+    pool_max_size: 10
+pubsub:
+  host: localhost
+  port: 9901
 developer:
   log_level:
     file: DEBUG
-    tui: INFO
+    tui: DEBUG
   recvWindow: 15000

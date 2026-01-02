@@ -373,6 +373,29 @@ class IsolatedLoop:
 
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
+    def create_task(self, coro: Awaitable[T]) -> asyncio.Task[T]:
+        """
+        Create a task on this isolated loop.
+
+        Args:
+            coro: The coroutine to wrap in a task.
+
+        Returns:
+            The created task.
+        """
+        if self._loop is None or not self._loop.is_running():
+            raise RuntimeError("Loop not running")
+
+        # Must create task from within the loop's thread
+        future: concurrent.futures.Future[asyncio.Task[T]] = concurrent.futures.Future()
+
+        def _create() -> None:
+            task = self._loop.create_task(coro)
+            future.set_result(task)
+
+        self._loop.call_soon_threadsafe(_create)
+        return future.result(timeout=5.0)
+
     @contextmanager
     def running(self) -> Generator[IsolatedLoop, None, None]:
         """
@@ -410,3 +433,44 @@ def shutdown_all(timeout: float = 5.0) -> None:
     if _thread_executor is not None:
         _thread_executor.shutdown(wait=True)
         _thread_executor = None
+
+    # Shutdown exchange loop
+    stop_exchange_loop()
+
+
+# =============================================================================
+# Exchange Loop Singleton
+# =============================================================================
+
+_exchange_loop: IsolatedLoop | None = None
+_exchange_loop_lock = threading.Lock()
+
+
+def get_exchange_loop() -> IsolatedLoop:
+    """
+    Get the global isolated exchange loop (singleton).
+
+    Creates and starts the loop if it doesn't exist.
+    Used for critical exchange operations (position polling, order reconciliation).
+
+    Returns:
+        The global IsolatedLoop instance for exchange operations.
+    """
+    global _exchange_loop
+
+    with _exchange_loop_lock:
+        if _exchange_loop is None or not _exchange_loop.is_running:
+            _exchange_loop = IsolatedLoop(name="exchange-critical")
+            _exchange_loop.start()
+
+        return _exchange_loop
+
+
+def stop_exchange_loop() -> None:
+    """Stop the global isolated exchange loop."""
+    global _exchange_loop
+
+    with _exchange_loop_lock:
+        if _exchange_loop is not None:
+            _exchange_loop.stop()
+            _exchange_loop = None

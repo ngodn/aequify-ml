@@ -1,0 +1,124 @@
+trading:
+  enabled: true
+  mode: live # demo / live
+  position_poll_delay: 60
+  order_reconciliation_interval: 90
+  disable_trading_on_window_utc:
+    - - 2320
+      - 2321
+  risk:
+    max_positions: 20
+  futures:
+    margin_mode: CROSS
+    leverage: 10
+    long:
+      enabled: true
+      initial_entry_size_usdt: 6.25
+      dca_multiplier: 4.25
+      maximum_position_size_usdt: 180.0
+    short:
+      enabled: true
+      initial_entry_size_usdt: 6.25
+      dca_multiplier: 4.25
+      maximum_position_size_usdt: 180.0
+filters:
+  - name: absolute_price_percentage_change
+    enabled: true
+    config:
+      top: 20
+  - name: symbol_filter
+    enabled: true
+    config:
+      pair: USDT
+      blacklist:
+        - 币安人生 # Chinese chars - causes encoding issues
+        - BTC
+        - ETH
+        - ADA
+        - XRP
+      whitelist: []
+engines:
+  apex:
+    bootstrap:
+      min_lookback_days: 7.0
+      trades_lookback_days: 90.0
+      max_trades: 10000000
+      max_cache_valid_days: 7.0 # If cache < 7 days old, skip backfill + bootstrap entirely
+      rolling_kernel:
+        lookback_windows_ms:
+          - 900000 # 15 minutes
+          - 14400000 # 4 hours
+      volume_imbalance_kernel:
+        price_tolerance_pct: 2.5
+      position:
+        target_profit_pct:
+          min: 1.75
+          max: 3.75
+          step: 1.0
+          default: 1.5
+        stop_loss_pct:
+          min: -2.5
+          max: -1.0
+          step: 0.5
+          default: -1.0
+        max_hold_time_ms:
+          min: 900000
+          max: 14400000
+          step: 3600000
+          default: 900000
+      long:
+        signal_offset: 0.25
+        price_move_pct:
+          min: -10.75
+          max: -2.75
+          step: 2.0
+          default: -3.5
+        volume_imbalance_threshold:
+          min: -90
+          max: -60
+          step: 10
+          default: -50
+        dca_distance_pct:
+          min: -10.75
+          max: -2.75
+          step: 2.0
+          default: -3.5
+      short:
+        signal_offset: 0.25
+        price_move_pct:
+          min: 10.0
+          max: 40.0
+          step: 10.0
+          default: 7.0
+        volume_imbalance_threshold:
+          min: 60
+          max: 90
+          step: 10
+          default: 50
+        dca_distance_pct:
+          min: 10.0
+          max: 40.0
+          step: 10.0
+          default: 7.0
+    live:
+      lookback_windows_ms: 14400000
+database:
+  hot: 
+    flush_window_ms: 900000
+  cold:
+    host: localhost
+    ilp_port: 9009
+    pg_port: 8812
+    pg_user: admin
+    pg_password: quest
+    pg_database: qdb
+    pool_min_size: 2
+    pool_max_size: 10
+pubsub:
+  host: localhost
+  port: 9901
+developer:
+  log_level:
+    file: DEBUG
+    tui: INFO
+  recvWindow: 15000

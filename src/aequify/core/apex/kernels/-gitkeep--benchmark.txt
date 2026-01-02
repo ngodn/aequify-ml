@@ -1,0 +1,1072 @@
+# """
+# Kernel Benchmark - Test and compare CPU vs GPU rolling kernels.
+
+# Loads CSV trade data and benchmarks:
+# - Rolling High (CPU single-threaded, CPU parallel, GPU)
+# - Rolling Low (CPU single-threaded, CPU parallel, GPU)
+
+# Usage:
+#     Call run_benchmarks() from a script outside the package.
+# """
+
+# from math import ceildiv
+# from sys import has_accelerator
+# from time import perf_counter_ns
+
+# from collections import InlineArray
+# from gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+# from memory import UnsafePointer, memcpy, alloc
+# from python import Python, PythonObject
+
+# # Import kernel functions using relative imports
+# from .rolling_high import (
+#     rolling_high_cpu,
+#     rolling_high_cpu_parallel,
+#     rolling_high_gpu,
+# )
+# from .rolling_low import (
+#     rolling_low_cpu,
+#     rolling_low_cpu_parallel,
+#     rolling_low_gpu,
+#     NO_LOW_SENTINEL,
+# )
+# from .volume_imbalance import (
+#     volume_imbalance_gpu,
+#     volume_imbalance_cpu,
+#     get_max_trades_for_vram,
+#     get_memory_config,
+#     compute_num_buckets,
+#     compute_price_range_cpu,
+# )
+# from .grid_search import (
+#     grid_search_long_gpu,
+#     grid_search_short_gpu,
+#     get_block_size,
+#     get_warps_per_block,
+#     get_warp_size,
+#     get_start_idx,
+#     get_min_gap,
+# )
+
+
+# # =============================================================================
+# # Constants
+# # =============================================================================
+
+# comptime CSV_DIR = "/home/eins0fx/development/aequify/aequify-core/data/csv/LIGHTUSDT"
+# comptime WARMUP_RUNS: Int = 3
+# comptime BENCHMARK_RUNS: Int = 5
+# comptime MAX_CSV_FILES: Int = 7  # 7 days of data
+
+# # Lookback windows to benchmark (in milliseconds)
+# # 15min, 30min, 45min, 1hr, 4hrs
+# fn get_lookback_windows() -> List[Int64]:
+#     """Get the list of lookback windows to benchmark."""
+#     var windows = List[Int64]()
+#     windows.append(900_000)    # 15 minutes
+#     windows.append(1_800_000)  # 30 minutes
+#     windows.append(2_700_000)  # 45 minutes
+#     windows.append(3_600_000)  # 1 hour
+#     windows.append(14_400_000) # 4 hours
+#     return windows^
+
+
+# # =============================================================================
+# # CSV Loading
+# # =============================================================================
+
+
+# fn load_csv_trades(csv_path: String) raises -> Tuple[List[Int64], List[Float64], List[Float64], List[Int32]]:
+#     """Load trades from CSV file.
+
+#     CSV format: agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker
+
+#     Returns:
+#         Tuple of (timestamps, prices, quantities, sides) lists.
+#         Sides: 1 = buy (taker), 0 = sell (maker).
+#     """
+#     var np = Python.import_module("numpy")
+#     var pd = Python.import_module("pandas")
+
+#     print("Loading CSV: " + csv_path)
+
+#     # Load with pandas for speed
+#     var df = pd.read_csv(csv_path)
+#     var n = Int(len(df))
+
+#     print("  Loaded " + String(n) + " trades")
+
+#     # Extract columns using PythonObject for string keys
+#     var timestamps_np = df[PythonObject("transact_time")].values.astype(np.int64)
+#     var prices_np = df[PythonObject("price")].values.astype(np.float64)
+#     var quantities_np = df[PythonObject("quantity")].values.astype(np.float64)
+#     # is_buyer_maker: True = maker is buyer, so taker is seller (side=0)
+#     # is_buyer_maker: False = maker is seller, so taker is buyer (side=1)
+#     var is_buyer_maker_np = df[PythonObject("is_buyer_maker")].values
+
+#     # Convert to Mojo lists
+#     var timestamps = List[Int64](capacity=n)
+#     var prices = List[Float64](capacity=n)
+#     var quantities = List[Float64](capacity=n)
+#     var sides = List[Int32](capacity=n)
+
+#     for i in range(n):
+#         timestamps.append(Int64(timestamps_np[i]))
+#         prices.append(Float64(prices_np[i]))
+#         quantities.append(Float64(quantities_np[i]))
+#         # Convert is_buyer_maker to side: if buyer is maker, taker is seller (0), else buyer (1)
+#         var is_buyer_maker = Bool(is_buyer_maker_np[i])
+#         sides.append(Int32(0) if is_buyer_maker else Int32(1))
+
+#     return (timestamps^, prices^, quantities^, sides^)
+
+
+# fn load_multiple_csv(max_files: Int = 3) raises -> Tuple[List[Int64], List[Float64], List[Float64], List[Int32]]:
+#     """Load multiple CSV files and merge them.
+
+#     Args:
+#         max_files: Maximum number of files to load.
+
+#     Returns:
+#         Tuple of (timestamps, prices, quantities, sides) lists.
+#     """
+#     var glob = Python.import_module("glob")
+#     var builtins = Python.import_module("builtins")
+
+#     var pattern = CSV_DIR + "/*.csv"
+#     var files = glob.glob(pattern)
+#     var file_list = builtins.list(files)
+
+#     # Sort files
+#     file_list.sort()
+
+#     var all_timestamps = List[Int64]()
+#     var all_prices = List[Float64]()
+#     var all_quantities = List[Float64]()
+#     var all_sides = List[Int32]()
+
+#     var files_loaded = 0
+#     for i in range(len(file_list)):
+#         if files_loaded >= max_files:
+#             break
+
+#         var filepath = String(file_list[i])
+#         var data = load_csv_trades(filepath)
+
+#         for j in range(len(data[0])):
+#             all_timestamps.append(data[0][j])
+#             all_prices.append(data[1][j])
+#             all_quantities.append(data[2][j])
+#             all_sides.append(data[3][j])
+
+#         files_loaded += 1
+
+#     print("\nTotal trades loaded: " + String(len(all_timestamps)))
+#     return (all_timestamps^, all_prices^, all_quantities^, all_sides^)
+
+
+# # =============================================================================
+# # Benchmarking Utilities
+# # =============================================================================
+
+
+# fn format_time_ns(ns: Int) -> String:
+#     """Format nanoseconds as human-readable string."""
+#     if ns >= 1_000_000_000:
+#         return String(Float64(ns) / 1e9) + " s"
+#     elif ns >= 1_000_000:
+#         return String(Float64(ns) / 1e6) + " ms"
+#     elif ns >= 1_000:
+#         return String(Float64(ns) / 1e3) + " us"
+#     else:
+#         return String(ns) + " ns"
+
+
+# fn format_lookback_ms(ms: Int64) -> String:
+#     """Format lookback milliseconds as human-readable string."""
+#     var minutes = ms // 60_000
+#     if minutes >= 60:
+#         var hours = minutes // 60
+#         return String(hours) + "h"
+#     else:
+#         return String(minutes) + "m"
+
+
+# fn verify_results(
+#     cpu_result: UnsafePointer[Float64],
+#     gpu_result: UnsafePointer[Float64],
+#     n: Int,
+#     tolerance: Float64 = 1e-10,
+# ) -> Bool:
+#     """Verify that CPU and GPU results match within tolerance."""
+#     var mismatches = 0
+#     var first_mismatch_idx = -1
+#     var first_mismatch_cpu: Float64 = 0.0
+#     var first_mismatch_gpu: Float64 = 0.0
+
+#     for i in range(n):
+#         var cpu_val = cpu_result[i]
+#         var gpu_val = gpu_result[i]
+
+#         # Handle special sentinel values
+#         if cpu_val == NO_LOW_SENTINEL and gpu_val == NO_LOW_SENTINEL:
+#             continue
+#         if cpu_val == 0.0 and gpu_val == 0.0:
+#             continue
+
+#         var diff = abs(cpu_val - gpu_val)
+#         var rel_diff = diff / max(abs(cpu_val), abs(gpu_val), 1e-10)
+
+#         if rel_diff > tolerance:
+#             mismatches += 1
+#             if first_mismatch_idx < 0:
+#                 first_mismatch_idx = i
+#                 first_mismatch_cpu = cpu_val
+#                 first_mismatch_gpu = gpu_val
+
+#     if mismatches > 0:
+#         print("  MISMATCH: " + String(mismatches) + " values differ")
+#         print("    First at index " + String(first_mismatch_idx) +
+#               ": CPU=" + String(first_mismatch_cpu) +
+#               ", GPU=" + String(first_mismatch_gpu))
+#         return False
+
+#     return True
+
+
+# # =============================================================================
+# # CPU Benchmarks
+# # =============================================================================
+
+
+# fn benchmark_rolling_high_cpu[
+#     origin: MutOrigin,
+# ](
+#     timestamps: UnsafePointer[Int64],
+#     prices: UnsafePointer[Float64],
+#     result: UnsafePointer[Float64, origin],
+#     lookback_ms: Int64,
+#     n: Int,
+#     parallel: Bool,
+# ) -> Int:
+#     """Benchmark rolling high CPU kernel.
+
+#     Returns:
+#         Average time in nanoseconds.
+#     """
+#     var label = "CPU Parallel" if parallel else "CPU Single"
+#     print("\n--- Rolling High (" + label + ") ---")
+
+#     # Warmup
+#     for _ in range(WARMUP_RUNS):
+#         if parallel:
+#             rolling_high_cpu_parallel(timestamps, prices, result, lookback_ms, n)
+#         else:
+#             rolling_high_cpu(timestamps, prices, result, lookback_ms, n)
+
+#     # Benchmark
+#     var total_ns: Int = 0
+#     for _ in range(BENCHMARK_RUNS):
+#         var start = Int(perf_counter_ns())
+#         if parallel:
+#             rolling_high_cpu_parallel(timestamps, prices, result, lookback_ms, n)
+#         else:
+#             rolling_high_cpu(timestamps, prices, result, lookback_ms, n)
+#         var end = Int(perf_counter_ns())
+#         total_ns += end - start
+
+#     var avg_ns = total_ns // BENCHMARK_RUNS
+#     print("  Average time: " + format_time_ns(avg_ns))
+#     print("  Throughput: " + String(Float64(n) / (Float64(avg_ns) / 1e9)) + " elements/sec")
+
+#     return avg_ns
+
+
+# fn benchmark_rolling_low_cpu[
+#     origin: MutOrigin,
+# ](
+#     timestamps: UnsafePointer[Int64],
+#     prices: UnsafePointer[Float64],
+#     result: UnsafePointer[Float64, origin],
+#     lookback_ms: Int64,
+#     n: Int,
+#     parallel: Bool,
+# ) -> Int:
+#     """Benchmark rolling low CPU kernel.
+
+#     Returns:
+#         Average time in nanoseconds.
+#     """
+#     var label = "CPU Parallel" if parallel else "CPU Single"
+#     print("\n--- Rolling Low (" + label + ") ---")
+
+#     # Warmup
+#     for _ in range(WARMUP_RUNS):
+#         if parallel:
+#             rolling_low_cpu_parallel(timestamps, prices, result, lookback_ms, n)
+#         else:
+#             rolling_low_cpu(timestamps, prices, result, lookback_ms, n)
+
+#     # Benchmark
+#     var total_ns: Int = 0
+#     for _ in range(BENCHMARK_RUNS):
+#         var start = Int(perf_counter_ns())
+#         if parallel:
+#             rolling_low_cpu_parallel(timestamps, prices, result, lookback_ms, n)
+#         else:
+#             rolling_low_cpu(timestamps, prices, result, lookback_ms, n)
+#         var end = Int(perf_counter_ns())
+#         total_ns += end - start
+
+#     var avg_ns = total_ns // BENCHMARK_RUNS
+#     print("  Average time: " + format_time_ns(avg_ns))
+#     print("  Throughput: " + String(Float64(n) / (Float64(avg_ns) / 1e9)) + " elements/sec")
+
+#     return avg_ns
+
+
+# # =============================================================================
+# # Volume Imbalance CPU Benchmarks (removed - naive version no longer exists)
+# # =============================================================================
+
+
+# # =============================================================================
+# # GPU Benchmarks
+# # =============================================================================
+
+
+# fn benchmark_rolling_high_gpu(
+#     ctx: DeviceContext,
+#     timestamps_dev: DeviceBuffer[DType.int64],
+#     prices_dev: DeviceBuffer[DType.float64],
+#     result_dev: DeviceBuffer[DType.float64],
+#     lookback_ms: Int64,
+#     n: Int,
+# ) raises -> Int:
+#     """Benchmark rolling high GPU kernel.
+
+#     Returns:
+#         Average time in nanoseconds.
+#     """
+#     print("\n--- Rolling High (GPU) ---")
+
+#     # Warmup
+#     for _ in range(WARMUP_RUNS):
+#         rolling_high_gpu(ctx, timestamps_dev, prices_dev, result_dev, lookback_ms, n)
+#         ctx.synchronize()
+
+#     # Benchmark
+#     var total_ns: Int = 0
+#     for _ in range(BENCHMARK_RUNS):
+#         var start = Int(perf_counter_ns())
+#         rolling_high_gpu(ctx, timestamps_dev, prices_dev, result_dev, lookback_ms, n)
+#         ctx.synchronize()
+#         var end = Int(perf_counter_ns())
+#         total_ns += end - start
+
+#     var avg_ns = total_ns // BENCHMARK_RUNS
+#     print("  Average time: " + format_time_ns(avg_ns))
+#     print("  Throughput: " + String(Float64(n) / (Float64(avg_ns) / 1e9)) + " elements/sec")
+
+#     return avg_ns
+
+
+# fn benchmark_rolling_low_gpu(
+#     ctx: DeviceContext,
+#     timestamps_dev: DeviceBuffer[DType.int64],
+#     prices_dev: DeviceBuffer[DType.float64],
+#     result_dev: DeviceBuffer[DType.float64],
+#     lookback_ms: Int64,
+#     n: Int,
+# ) raises -> Int:
+#     """Benchmark rolling low GPU kernel.
+
+#     Returns:
+#         Average time in nanoseconds.
+#     """
+#     print("\n--- Rolling Low (GPU) ---")
+
+#     # Warmup
+#     for _ in range(WARMUP_RUNS):
+#         rolling_low_gpu(ctx, timestamps_dev, prices_dev, result_dev, lookback_ms, n)
+#         ctx.synchronize()
+
+#     # Benchmark
+#     var total_ns: Int = 0
+#     for _ in range(BENCHMARK_RUNS):
+#         var start = Int(perf_counter_ns())
+#         rolling_low_gpu(ctx, timestamps_dev, prices_dev, result_dev, lookback_ms, n)
+#         ctx.synchronize()
+#         var end = Int(perf_counter_ns())
+#         total_ns += end - start
+
+#     var avg_ns = total_ns // BENCHMARK_RUNS
+#     print("  Average time: " + format_time_ns(avg_ns))
+#     print("  Throughput: " + String(Float64(n) / (Float64(avg_ns) / 1e9)) + " elements/sec")
+
+#     return avg_ns
+
+
+# fn benchmark_volume_imbalance_gpu_prefixsum(
+#     ctx: DeviceContext,
+#     timestamps_dev: DeviceBuffer[DType.int64],
+#     prices_dev: DeviceBuffer[DType.float64],
+#     quantities_dev: DeviceBuffer[DType.float64],
+#     sides_dev: DeviceBuffer[DType.int32],
+#     result_dev: DeviceBuffer[DType.float64],
+#     min_price: Float64,
+#     max_price: Float64,
+#     price_tolerance_pct: Float64,
+#     n: Int,
+# ) raises -> Int:
+#     """Benchmark volume imbalance GPU kernel (prefix sum approach).
+
+#     Returns:
+#         Average time in nanoseconds.
+#     """
+#     var num_buckets = compute_num_buckets(price_tolerance_pct)
+#     print("\n--- Volume Imbalance (GPU, Prefix Sum) ---")
+#     print("  Buckets: " + String(num_buckets) + " (tolerance: " + String(price_tolerance_pct) + "%)")
+
+#     # Warmup
+#     for _ in range(WARMUP_RUNS):
+#         volume_imbalance_gpu(ctx, timestamps_dev, prices_dev, quantities_dev, sides_dev, result_dev, min_price, max_price, price_tolerance_pct, n)
+#         ctx.synchronize()
+
+#     # Benchmark
+#     var total_ns: Int = 0
+#     for _ in range(BENCHMARK_RUNS):
+#         var start = Int(perf_counter_ns())
+#         volume_imbalance_gpu(ctx, timestamps_dev, prices_dev, quantities_dev, sides_dev, result_dev, min_price, max_price, price_tolerance_pct, n)
+#         ctx.synchronize()
+#         var end = Int(perf_counter_ns())
+#         total_ns += end - start
+
+#     var avg_ns = total_ns // BENCHMARK_RUNS
+#     print("  Average time: " + format_time_ns(avg_ns))
+#     print("  Throughput: " + String(Float64(n) / (Float64(avg_ns) / 1e9)) + " elements/sec")
+
+#     return avg_ns
+
+
+# # =============================================================================
+# # Grid Search GPU Benchmarks
+# # =============================================================================
+
+
+# fn generate_param_grid_np(n_windows: Int, is_long: Bool) raises -> PythonObject:
+#     """Generate parameter grid using numpy (matching old bootstrap.mojo approach).
+
+#     Uses numpy for cartesian product generation via nested loops, matching the
+#     original Python/Mojo interface where param grids are passed as numpy arrays.
+
+#     Kernel expects 9 params per combo:
+#         [pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist]
+
+#     Args:
+#         n_windows: Number of lookback windows.
+#         is_long: True for LONG strategy, False for SHORT.
+
+#     Returns:
+#         numpy array of shape (n_combos, 9) with all parameter combinations.
+#     """
+#     var np = Python.import_module("numpy")
+
+#     # Parameter values using numpy arange (matching ParameterBounds.grid_values())
+#     var pms: PythonObject
+#     var dts: PythonObject
+#     var dcas: PythonObject
+
+#     if is_long:
+#         # LONG: negative pm/dt/dca_dist
+#         pms = np.arange(-5.0, -0.9, 1.0)    # -5, -4, -3, -2, -1
+#         dts = np.arange(-30.0, -9.9, 10.0)  # -30, -20, -10
+#         dcas = np.arange(-3.0, -0.9, 1.0)   # -3, -2, -1
+#     else:
+#         # SHORT: positive pm/dt/dca_dist
+#         pms = np.arange(1.0, 5.1, 1.0)      # 1, 2, 3, 4, 5
+#         dts = np.arange(10.0, 30.1, 10.0)   # 10, 20, 30
+#         dcas = np.arange(1.0, 3.1, 1.0)     # 1, 2, 3
+
+#     var tps = np.arange(0.5, 2.1, 0.5)                # 0.5, 1.0, 1.5, 2.0
+#     var sls = np.arange(-3.0, -0.9, 1.0)              # -3, -2, -1
+#     var mhs = np.arange(3600000.0, 7200001.0, 3600000.0)  # 1h, 2h in ms
+#     var dca_mults = np.arange(2.0, 4.26, 2.25)            # 2.0, 4.25
+#     var max_pos_mults = np.arange(5.0, 10.1, 5.0)         # 5.0, 10.0
+
+#     # Build combos using nested loops (matching config.py get_long_param_grid)
+#     var builtins = Python.import_module("builtins")
+#     var combos = builtins.list()
+#     for pm_idx in range(Int(len(pms))):
+#         var pm = pms[pm_idx]
+#         for w_idx in range(n_windows):
+#             for dt_idx in range(Int(len(dts))):
+#                 var dt = dts[dt_idx]
+#                 for tp_idx in range(Int(len(tps))):
+#                     var tp = tps[tp_idx]
+#                     for sl_idx in range(Int(len(sls))):
+#                         var sl = sls[sl_idx]
+#                         for mh_idx in range(Int(len(mhs))):
+#                             var mh = mhs[mh_idx]
+#                             for dca_mult_idx in range(Int(len(dca_mults))):
+#                                 var dca_mult_val = dca_mults[dca_mult_idx]
+#                                 for max_pos_idx in range(Int(len(max_pos_mults))):
+#                                     var max_pos = max_pos_mults[max_pos_idx]
+#                                     for dca_idx in range(Int(len(dcas))):
+#                                         var dca = dcas[dca_idx]
+#                                         # Create combo list with 9 params
+#                                         var combo = builtins.list()
+#                                         _ = combo.append(pm)
+#                                         _ = combo.append(PythonObject(w_idx))
+#                                         _ = combo.append(dt)
+#                                         _ = combo.append(tp)
+#                                         _ = combo.append(sl)
+#                                         _ = combo.append(mh)
+#                                         _ = combo.append(dca_mult_val)
+#                                         _ = combo.append(max_pos)
+#                                         _ = combo.append(dca)
+#                                         _ = combos.append(combo)
+
+#     return np.array(combos, dtype=np.float64)
+
+
+# fn benchmark_grid_search_long_gpu(
+#     ctx: DeviceContext,
+#     timestamps_dev: DeviceBuffer[DType.int64],
+#     prices_dev: DeviceBuffer[DType.float64],
+#     deltas_dev: DeviceBuffer[DType.float64],
+#     rolling_highs_dev: DeviceBuffer[DType.float64],
+#     param_combos_dev: DeviceBuffer[DType.float64],
+#     out_entries_dev: DeviceBuffer[DType.int32],
+#     out_winners_dev: DeviceBuffer[DType.int32],
+#     out_pnl_dev: DeviceBuffer[DType.float64],
+#     n_combos: Int,
+#     n_windows: Int,
+#     n_prices: Int,
+#     max_scan: Int,
+#     outer_stride: Int,
+# ) raises -> Int:
+#     """Benchmark grid search LONG GPU kernel.
+
+#     Returns:
+#         Average time in nanoseconds.
+#     """
+#     print("\n--- Grid Search LONG (GPU) ---")
+#     print("  Parameter combos: " + String(n_combos))
+#     print("  Warps per block: " + String(get_warps_per_block()))
+#     print("  Warp size: " + String(get_warp_size()))
+
+#     # Warmup
+#     for _ in range(WARMUP_RUNS):
+#         grid_search_long_gpu(
+#             ctx, timestamps_dev, prices_dev, deltas_dev, rolling_highs_dev,
+#             param_combos_dev, out_entries_dev, out_winners_dev, out_pnl_dev,
+#             n_combos, n_windows, n_prices, max_scan, outer_stride
+#         )
+#         ctx.synchronize()
+
+#     # Benchmark
+#     var total_ns: Int = 0
+#     for _ in range(BENCHMARK_RUNS):
+#         var start = Int(perf_counter_ns())
+#         grid_search_long_gpu(
+#             ctx, timestamps_dev, prices_dev, deltas_dev, rolling_highs_dev,
+#             param_combos_dev, out_entries_dev, out_winners_dev, out_pnl_dev,
+#             n_combos, n_windows, n_prices, max_scan, outer_stride
+#         )
+#         ctx.synchronize()
+#         var end = Int(perf_counter_ns())
+#         total_ns += end - start
+
+#     var avg_ns = total_ns // BENCHMARK_RUNS
+#     print("  Average time: " + format_time_ns(avg_ns))
+#     print("  Throughput: " + String(Float64(n_combos) / (Float64(avg_ns) / 1e9)) + " combos/sec")
+#     print("  Trades processed: " + String(n_prices) + " per combo")
+
+#     return avg_ns
+
+
+# fn benchmark_grid_search_short_gpu(
+#     ctx: DeviceContext,
+#     timestamps_dev: DeviceBuffer[DType.int64],
+#     prices_dev: DeviceBuffer[DType.float64],
+#     deltas_dev: DeviceBuffer[DType.float64],
+#     rolling_lows_dev: DeviceBuffer[DType.float64],
+#     param_combos_dev: DeviceBuffer[DType.float64],
+#     out_entries_dev: DeviceBuffer[DType.int32],
+#     out_winners_dev: DeviceBuffer[DType.int32],
+#     out_pnl_dev: DeviceBuffer[DType.float64],
+#     n_combos: Int,
+#     n_windows: Int,
+#     n_prices: Int,
+#     max_scan: Int,
+#     outer_stride: Int,
+# ) raises -> Int:
+#     """Benchmark grid search SHORT GPU kernel.
+
+#     Returns:
+#         Average time in nanoseconds.
+#     """
+#     print("\n--- Grid Search SHORT (GPU) ---")
+#     print("  Parameter combos: " + String(n_combos))
+#     print("  Warps per block: " + String(get_warps_per_block()))
+#     print("  Warp size: " + String(get_warp_size()))
+
+#     # Warmup
+#     for _ in range(WARMUP_RUNS):
+#         grid_search_short_gpu(
+#             ctx, timestamps_dev, prices_dev, deltas_dev, rolling_lows_dev,
+#             param_combos_dev, out_entries_dev, out_winners_dev, out_pnl_dev,
+#             n_combos, n_windows, n_prices, max_scan, outer_stride
+#         )
+#         ctx.synchronize()
+
+#     # Benchmark
+#     var total_ns: Int = 0
+#     for _ in range(BENCHMARK_RUNS):
+#         var start = Int(perf_counter_ns())
+#         grid_search_short_gpu(
+#             ctx, timestamps_dev, prices_dev, deltas_dev, rolling_lows_dev,
+#             param_combos_dev, out_entries_dev, out_winners_dev, out_pnl_dev,
+#             n_combos, n_windows, n_prices, max_scan, outer_stride
+#         )
+#         ctx.synchronize()
+#         var end = Int(perf_counter_ns())
+#         total_ns += end - start
+
+#     var avg_ns = total_ns // BENCHMARK_RUNS
+#     print("  Average time: " + format_time_ns(avg_ns))
+#     print("  Throughput: " + String(Float64(n_combos) / (Float64(avg_ns) / 1e9)) + " combos/sec")
+#     print("  Trades processed: " + String(n_prices) + " per combo")
+
+#     return avg_ns
+
+
+# # =============================================================================
+# # Main Benchmark
+# # =============================================================================
+
+
+# fn run_benchmarks() raises:
+#     """Run all benchmarks."""
+#     print("=" * 60)
+#     print("APEX Kernel Benchmark")
+#     print("=" * 60)
+
+#     # Check GPU availability
+#     var gpu_available = has_accelerator()
+#     print("\nGPU Available: " + String(gpu_available))
+
+#     # Load data
+#     print("\n" + "-" * 60)
+#     print("Loading Data")
+#     print("-" * 60)
+
+#     var data = load_multiple_csv(max_files=MAX_CSV_FILES)
+#     var n = len(data[0])
+
+#     if n == 0:
+#         print("ERROR: No data loaded!")
+#         return
+
+#     # Convert to raw pointers for kernel input
+#     var timestamps_ptr = alloc[Int64](n)
+#     var prices_ptr = alloc[Float64](n)
+#     var quantities_ptr = alloc[Float64](n)
+#     var sides_ptr = alloc[Int32](n)
+
+#     for i in range(n):
+#         timestamps_ptr[i] = data[0][i]
+#         prices_ptr[i] = data[1][i]
+#         quantities_ptr[i] = data[2][i]
+#         sides_ptr[i] = data[3][i]
+
+#     # Allocate result buffers
+#     var result_cpu_single = alloc[Float64](n)
+#     var result_cpu_parallel = alloc[Float64](n)
+
+#     # Volume imbalance parameters
+#     var price_tolerance_pct: Float64 = 0.1  # 0.1% price tolerance for naive kernel
+#     var price_tolerance_optimized: Float64 = 2.5  # 2.5% for optimized kernel
+
+#     # Compute price range for optimized kernel
+#     var price_range = compute_price_range_cpu(prices_ptr, n)
+#     var min_price = price_range[0]
+#     var max_price = price_range[1]
+
+#     print("\nData size: " + String(n) + " trades (" + String(MAX_CSV_FILES) + " days)")
+#     print("Price range: " + String(min_price) + " - " + String(max_price))
+#     print("Lookback windows: 15m, 30m, 45m, 1h, 4h")
+#     print("Volume imbalance naive tolerance: " + String(price_tolerance_pct) + "%")
+#     print("Volume imbalance optimized tolerance: " + String(price_tolerance_optimized) + "%")
+
+#     # Show memory configuration for optimized kernel
+#     var mem_config = get_memory_config(n, price_tolerance_optimized)
+#     print("\nOptimized kernel memory config:")
+#     print("  Buckets: " + String(Int(mem_config.__getitem__(PythonObject("num_buckets")))))
+#     print("  Memory required: " + String(Float64(mem_config.__getitem__(PythonObject("total_gb_required")))) + " GB")
+#     print("  Available VRAM: " + String(Float64(mem_config.__getitem__(PythonObject("available_vram_gb")))) + " GB")
+#     print("  Max trades for VRAM: " + String(Int(mem_config.__getitem__(PythonObject("max_trades")))))
+#     print("  Fits in VRAM: " + String(Bool(mem_config.__getitem__(PythonObject("fits_in_vram")))))
+
+#     var lookback_windows = get_lookback_windows()
+
+#     # ==========================================================================
+#     # CPU Benchmarks
+#     # ==========================================================================
+#     print("\n" + "=" * 60)
+#     print("CPU BENCHMARKS -- SKIPPED, RESULTS SHOW IT'S TOO SLOW")
+#     print("=" * 60)
+
+#     # for window_idx in range(len(lookback_windows)):
+#     #     var lookback_ms = lookback_windows[window_idx]
+#     #     var lookback_label = format_lookback_ms(lookback_ms)
+
+#     #     print("\n--- Lookback: " + lookback_label + " ---")
+
+#     #     # Rolling High
+#     #     var rh_cpu_single_ns = benchmark_rolling_high_cpu(
+#     #         timestamps_ptr, prices_ptr, result_cpu_single, lookback_ms, n, parallel=False
+#     #     )
+#     #     var rh_cpu_parallel_ns = benchmark_rolling_high_cpu(
+#     #         timestamps_ptr, prices_ptr, result_cpu_parallel, lookback_ms, n, parallel=True
+#     #     )
+
+#     #     # Rolling Low
+#     #     var rl_cpu_single_ns = benchmark_rolling_low_cpu(
+#     #         timestamps_ptr, prices_ptr, result_cpu_single, lookback_ms, n, parallel=False
+#     #     )
+#     #     var rl_cpu_parallel_ns = benchmark_rolling_low_cpu(
+#     #         timestamps_ptr, prices_ptr, result_cpu_parallel, lookback_ms, n, parallel=True
+#     #     )
+
+#     #     # Summary for rolling kernels
+#     #     print("\n  Summary:")
+#     #     print("    Rolling High - Single: " + format_time_ns(rh_cpu_single_ns) +
+#     #           ", Parallel: " + format_time_ns(rh_cpu_parallel_ns) +
+#     #           " (" + String(Float64(rh_cpu_single_ns) / Float64(rh_cpu_parallel_ns)) + "x)")
+#     #     print("    Rolling Low  - Single: " + format_time_ns(rl_cpu_single_ns) +
+#     #           ", Parallel: " + format_time_ns(rl_cpu_parallel_ns) +
+#     #           " (" + String(Float64(rl_cpu_single_ns) / Float64(rl_cpu_parallel_ns)) + "x)")
+
+#     # ==========================================================================
+#     # Volume Imbalance CPU Benchmarks (session-based, no lookback window)
+#     # ==========================================================================
+#     print("\n" + "=" * 60)
+#     print("VOLUME IMBALANCE CPU BENCHMARKS - SKIPPED, RESULTS SHOW IT'S TOO SLOW")
+#     print("=" * 60)
+
+#     # var vi_cpu_single_ns = benchmark_volume_imbalance_cpu(
+#     #     timestamps_ptr, prices_ptr, quantities_ptr, sides_ptr, result_cpu_single, price_tolerance_pct, n, parallel=False
+#     # )
+#     # var vi_cpu_parallel_ns = benchmark_volume_imbalance_cpu(
+#     #     timestamps_ptr, prices_ptr, quantities_ptr, sides_ptr, result_cpu_parallel, price_tolerance_pct, n, parallel=True
+#     # )
+
+#     # print("\n  Summary:")
+#     # print("    Volume Imbalance - Single: " + format_time_ns(vi_cpu_single_ns) +
+#     #       ", Parallel: " + format_time_ns(vi_cpu_parallel_ns) +
+#     #       " (" + String(Float64(vi_cpu_single_ns) / Float64(vi_cpu_parallel_ns)) + "x)")
+
+#     # ==========================================================================
+#     # GPU Benchmarks (if available)
+#     # ==========================================================================
+#     if gpu_available:
+#         print("\n" + "=" * 60)
+#         print("GPU BENCHMARKS")
+#         print("=" * 60)
+
+#         var ctx = DeviceContext()
+#         print("\nGPU: " + ctx.name())
+
+#         # Create device buffers
+#         var timestamps_dev = ctx.enqueue_create_buffer[DType.int64](n)
+#         var prices_dev = ctx.enqueue_create_buffer[DType.float64](n)
+#         var quantities_dev = ctx.enqueue_create_buffer[DType.float64](n)
+#         var sides_dev = ctx.enqueue_create_buffer[DType.int32](n)
+#         var result_dev = ctx.enqueue_create_buffer[DType.float64](n)
+
+#         # Create host buffers for transfer
+#         var timestamps_host = ctx.enqueue_create_host_buffer[DType.int64](n)
+#         var prices_host = ctx.enqueue_create_host_buffer[DType.float64](n)
+#         var quantities_host = ctx.enqueue_create_host_buffer[DType.float64](n)
+#         var sides_host = ctx.enqueue_create_host_buffer[DType.int32](n)
+#         ctx.synchronize()
+
+#         # Copy data to host buffers
+#         memcpy(
+#             dest=timestamps_host.unsafe_ptr().bitcast[UInt8](),
+#             src=timestamps_ptr.bitcast[UInt8](),
+#             count=n * 8,
+#         )
+#         memcpy(
+#             dest=prices_host.unsafe_ptr().bitcast[UInt8](),
+#             src=prices_ptr.bitcast[UInt8](),
+#             count=n * 8,
+#         )
+#         memcpy(
+#             dest=quantities_host.unsafe_ptr().bitcast[UInt8](),
+#             src=quantities_ptr.bitcast[UInt8](),
+#             count=n * 8,
+#         )
+#         memcpy(
+#             dest=sides_host.unsafe_ptr().bitcast[UInt8](),
+#             src=sides_ptr.bitcast[UInt8](),
+#             count=n * 4,  # Int32 = 4 bytes
+#         )
+
+#         # Upload to GPU
+#         print("\nUploading data to GPU...")
+#         var upload_start = Int(perf_counter_ns())
+#         ctx.enqueue_copy(dst_buf=timestamps_dev, src_buf=timestamps_host)
+#         ctx.enqueue_copy(dst_buf=prices_dev, src_buf=prices_host)
+#         ctx.enqueue_copy(dst_buf=quantities_dev, src_buf=quantities_host)
+#         ctx.enqueue_copy(dst_buf=sides_dev, src_buf=sides_host)
+#         ctx.synchronize()
+#         var upload_end = Int(perf_counter_ns())
+#         print("  Upload time: " + format_time_ns(upload_end - upload_start))
+
+#         # for window_idx in range(len(lookback_windows)):
+#         #     var lookback_ms = lookback_windows[window_idx]
+#         #     var lookback_label = format_lookback_ms(lookback_ms)
+
+#         #     print("\n--- Lookback: " + lookback_label + " ---")
+
+#         #     # Rolling High GPU
+#         #     var rh_gpu_ns = benchmark_rolling_high_gpu(
+#         #         ctx, timestamps_dev, prices_dev, result_dev, lookback_ms, n
+#         #     )
+
+#         #     # Rolling Low GPU
+#         #     var rl_gpu_ns = benchmark_rolling_low_gpu(
+#         #         ctx, timestamps_dev, prices_dev, result_dev, lookback_ms, n
+#         #     )
+
+#         #     # Summary
+#         #     print("\n  Summary:")
+#         #     print("    Rolling High: " + format_time_ns(rh_gpu_ns))
+#         #     print("    Rolling Low:  " + format_time_ns(rl_gpu_ns))
+
+#         # =======================================================================
+#         # Volume Imbalance GPU Benchmark
+#         # =======================================================================
+#         print("\n" + "-" * 60)
+#         print("VOLUME IMBALANCE GPU BENCHMARK - SKIPPED, RESULTS SHOW IT'S TOO SLOW")
+#         print("-" * 60)
+
+#         # var vi_gpu_ns = benchmark_volume_imbalance_gpu(
+#         #     ctx, timestamps_dev, prices_dev, quantities_dev, sides_dev, result_dev, price_tolerance_pct, n
+#         # )
+
+#         # print("\n  Summary:")
+#         # print("    Volume Imbalance GPU (naive): " + format_time_ns(vi_gpu_ns))
+
+#         # =======================================================================
+#         # Volume Imbalance GPU Benchmark (Prefix Sum Approach)
+#         # =======================================================================
+#         print("\n" + "-" * 60)
+#         print("VOLUME IMBALANCE GPU BENCHMARK (Prefix Sum)")
+#         print("-" * 60)
+
+#         var vi_gpu_ns = benchmark_volume_imbalance_gpu_prefixsum(
+#             ctx, timestamps_dev, prices_dev, quantities_dev, sides_dev, result_dev,
+#             min_price, max_price, price_tolerance_optimized, n
+#         )
+
+#         print("\n  Summary:")
+#         print("    Volume Imbalance GPU: " + format_time_ns(vi_gpu_ns))
+
+#         # # Compare naive vs optimized
+#         # if vi_opt_gpu_ns > 0:
+#         #     var speedup = Float64(vi_gpu_ns) / Float64(vi_opt_gpu_ns)
+#         #     print("\n  Naive vs Optimized Speedup:")
+#         #     print("    Naive: " + format_time_ns(vi_gpu_ns) +
+#         #           " -> Optimized: " + format_time_ns(vi_opt_gpu_ns) +
+#         #           " (" + String(speedup) + "x faster)")
+
+#         # =======================================================================
+#         # Grid Search GPU Benchmarks
+#         # =======================================================================
+#         print("\n" + "-" * 60)
+#         print("GRID SEARCH GPU BENCHMARKS")
+#         print("-" * 60)
+
+#         # Grid search parameters
+#         var n_windows = len(lookback_windows)
+#         var max_scan = 10000  # Max forward scan distance
+#         var outer_stride = 1  # Stride between lanes
+
+#         # First, compute rolling highs and lows for all windows
+#         print("\nPre-computing rolling highs and lows for grid search...")
+#         var rolling_size = n_windows * n
+#         var rolling_highs_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
+#         var rolling_lows_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
+
+#         # Compute rolling highs/lows for each window
+#         for w_idx in range(n_windows):
+#             var lookback_ms = lookback_windows[w_idx]
+#             var offset = w_idx * n
+
+#             # Create temporary result buffer at offset
+#             var rh_offset_dev = ctx.enqueue_create_buffer[DType.float64](n)
+#             var rl_offset_dev = ctx.enqueue_create_buffer[DType.float64](n)
+
+#             rolling_high_gpu(ctx, timestamps_dev, prices_dev, rh_offset_dev, lookback_ms, n)
+#             rolling_low_gpu(ctx, timestamps_dev, prices_dev, rl_offset_dev, lookback_ms, n)
+#             ctx.synchronize()
+
+#             # Copy to the correct offset in the full buffer
+#             # We need to copy from offset buffer to the rolling buffer at the right position
+#             # This is done by creating a host buffer and copying
+#             var rh_offset_host = ctx.enqueue_create_host_buffer[DType.float64](n)
+#             var rl_offset_host = ctx.enqueue_create_host_buffer[DType.float64](n)
+#             ctx.enqueue_copy(dst_buf=rh_offset_host, src_buf=rh_offset_dev)
+#             ctx.enqueue_copy(dst_buf=rl_offset_host, src_buf=rl_offset_dev)
+#             ctx.synchronize()
+
+#             # Create host buffers for the rolling buffers and copy data
+#             var rolling_highs_host = ctx.enqueue_create_host_buffer[DType.float64](rolling_size)
+#             var rolling_lows_host = ctx.enqueue_create_host_buffer[DType.float64](rolling_size)
+#             ctx.enqueue_copy(dst_buf=rolling_highs_host, src_buf=rolling_highs_dev)
+#             ctx.enqueue_copy(dst_buf=rolling_lows_host, src_buf=rolling_lows_dev)
+#             ctx.synchronize()
+
+#             # Copy the data at the offset
+#             memcpy(
+#                 dest=rolling_highs_host.unsafe_ptr().offset(offset).bitcast[UInt8](),
+#                 src=rh_offset_host.unsafe_ptr().bitcast[UInt8](),
+#                 count=n * 8,
+#             )
+#             memcpy(
+#                 dest=rolling_lows_host.unsafe_ptr().offset(offset).bitcast[UInt8](),
+#                 src=rl_offset_host.unsafe_ptr().bitcast[UInt8](),
+#                 count=n * 8,
+#             )
+
+#             # Copy back to device
+#             ctx.enqueue_copy(dst_buf=rolling_highs_dev, src_buf=rolling_highs_host)
+#             ctx.enqueue_copy(dst_buf=rolling_lows_dev, src_buf=rolling_lows_host)
+#             ctx.synchronize()
+
+#             # Free temporary buffers
+#             _ = rh_offset_dev^
+#             _ = rl_offset_dev^
+#             _ = rh_offset_host^
+#             _ = rl_offset_host^
+#             _ = rolling_highs_host^
+#             _ = rolling_lows_host^
+
+#         print("  Rolling highs/lows computed for " + String(n_windows) + " windows")
+
+#         # Generate parameter combinations using numpy (matching old bootstrap.mojo)
+#         print("\nGenerating parameter combinations...")
+#         var np_params = Python.import_module("numpy")
+#         var long_param_grid = generate_param_grid_np(n_windows, True)
+#         var short_param_grid = generate_param_grid_np(n_windows, False)
+
+#         var n_long_combos = Int(long_param_grid.shape[0])
+#         var n_short_combos = Int(short_param_grid.shape[0])
+
+#         print("  LONG combos: " + String(n_long_combos))
+#         print("  SHORT combos: " + String(n_short_combos))
+
+#         # Flatten and ensure contiguous
+#         var long_params = np_params.ascontiguousarray(long_param_grid.flatten(), dtype=np_params.float64)
+#         var short_params = np_params.ascontiguousarray(short_param_grid.flatten(), dtype=np_params.float64)
+
+#         # Create device buffers for parameters
+#         var long_params_dev = ctx.enqueue_create_buffer[DType.float64](n_long_combos * 9)
+#         var short_params_dev = ctx.enqueue_create_buffer[DType.float64](n_short_combos * 9)
+
+#         # Create host buffers
+#         var long_params_host = ctx.enqueue_create_host_buffer[DType.float64](n_long_combos * 9)
+#         var short_params_host = ctx.enqueue_create_host_buffer[DType.float64](n_short_combos * 9)
+#         ctx.synchronize()
+
+#         # Get numpy array addresses and copy to host buffers using memcpy
+#         var long_params_addr = Int(long_params.ctypes.data)
+#         var short_params_addr = Int(short_params.ctypes.data)
+
+#         memcpy(
+#             dest=long_params_host.unsafe_ptr().bitcast[UInt8](),
+#             src=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=long_params_addr),
+#             count=n_long_combos * 9 * 8,  # Float64 = 8 bytes
+#         )
+#         memcpy(
+#             dest=short_params_host.unsafe_ptr().bitcast[UInt8](),
+#             src=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=short_params_addr),
+#             count=n_short_combos * 9 * 8,  # Float64 = 8 bytes
+#         )
+
+#         # Upload to GPU
+#         ctx.enqueue_copy(dst_buf=long_params_dev, src_buf=long_params_host)
+#         ctx.enqueue_copy(dst_buf=short_params_dev, src_buf=short_params_host)
+#         ctx.synchronize()
+
+#         # Create output buffers
+#         var long_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_long_combos)
+#         var long_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_long_combos)
+#         var long_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_long_combos)
+
+#         var short_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_short_combos)
+#         var short_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_short_combos)
+#         var short_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_short_combos)
+
+#         # Benchmark LONG grid search
+#         var gs_long_ns = benchmark_grid_search_long_gpu(
+#             ctx, timestamps_dev, prices_dev, result_dev, rolling_highs_dev,
+#             long_params_dev, long_entries_dev, long_winners_dev, long_pnl_dev,
+#             n_long_combos, n_windows, n, max_scan, outer_stride
+#         )
+
+#         # Benchmark SHORT grid search
+#         var gs_short_ns = benchmark_grid_search_short_gpu(
+#             ctx, timestamps_dev, prices_dev, result_dev, rolling_lows_dev,
+#             short_params_dev, short_entries_dev, short_winners_dev, short_pnl_dev,
+#             n_short_combos, n_windows, n, max_scan, outer_stride
+#         )
+
+#         print("\n  Grid Search Summary:")
+#         print("    LONG:  " + format_time_ns(gs_long_ns) + " (" + String(n_long_combos) + " combos)")
+#         print("    SHORT: " + format_time_ns(gs_short_ns) + " (" + String(n_short_combos) + " combos)")
+
+#         # Free grid search buffers
+#         _ = rolling_highs_dev^
+#         _ = rolling_lows_dev^
+#         _ = long_params_dev^
+#         _ = short_params_dev^
+#         _ = long_params_host^
+#         _ = short_params_host^
+#         _ = long_entries_dev^
+#         _ = long_winners_dev^
+#         _ = long_pnl_dev^
+#         _ = short_entries_dev^
+#         _ = short_winners_dev^
+#         _ = short_pnl_dev^
+
+#         # Free GPU resources
+#         _ = timestamps_dev^
+#         _ = prices_dev^
+#         _ = quantities_dev^
+#         _ = sides_dev^
+#         _ = result_dev^
+#         _ = timestamps_host^
+#         _ = prices_host^
+#         _ = quantities_host^
+#         _ = sides_host^
+
+#     # Cleanup CPU buffers
+#     timestamps_ptr.free()
+#     prices_ptr.free()
+#     quantities_ptr.free()
+#     sides_ptr.free()
+#     result_cpu_single.free()
+#     result_cpu_parallel.free()
+
+#     print("\n" + "=" * 60)
+#     print("Benchmark Complete")
+#     print("=" * 60)
+
+
+# # Note: To run the benchmark, call run_benchmarks() from a script outside the package
+# # or create a separate benchmark runner script.

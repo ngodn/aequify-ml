@@ -86,9 +86,9 @@ class SelectedSymbolArea(Vertical):
         with SelectedSymbolTabbedContent(id="symbol-tabs"):
             with TabPane("Symbol Info", id="symbol-info-pane"):
                 yield SymbolInfoPane(id="symbol-info")
-            with TabPane("RTDS: @position", id="positions-pane"):
+            with TabPane("RTDS:@position", id="positions-pane"):
                 yield PositionsPane(id="positions")
-            with TabPane("RTDS: @trade", id="trade-stream-pane"):
+            with TabPane("RTDS:@trade", id="trade-stream-pane"):
                 yield TradeStreamPane(id="trade-stream")
             with TabPane("Engine: APEX", id="apex-chart-pane"):
                 yield APEXChartPane(id="apex-chart")

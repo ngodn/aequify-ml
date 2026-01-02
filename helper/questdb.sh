@@ -475,6 +475,60 @@ do_logs() {
     esac
 }
 
+do_flush() {
+    local table="$1"
+    local valid_tables=("trades" "bootstrap_results" "bootstrap_bounds")
+
+    if [[ -z "$table" ]]; then
+        log_error "Usage: $0 flush <table_name|all>"
+        echo ""
+        echo "Available tables:"
+        for t in "${valid_tables[@]}"; do
+            echo "  - $t"
+        done
+        exit 1
+    fi
+
+    if [[ "$table" == "all" ]]; then
+        log_info "Flushing all tables..."
+        for t in "${valid_tables[@]}"; do
+            flush_single_table "$t"
+        done
+    else
+        # Validate table name
+        local valid=false
+        for t in "${valid_tables[@]}"; do
+            if [[ "$t" == "$table" ]]; then
+                valid=true
+                break
+            fi
+        done
+
+        if [[ "$valid" == false ]]; then
+            log_error "Unknown table: $table"
+            echo "Valid tables: ${valid_tables[*]}"
+            exit 1
+        fi
+
+        flush_single_table "$table"
+    fi
+}
+
+flush_single_table() {
+    local table="$1"
+    local response
+
+    response=$(curl -s -G "http://localhost:9000/exec" --data-urlencode "query=TRUNCATE TABLE $table")
+
+    if echo "$response" | grep -q '"ddl":"OK"'; then
+        log_info "Flushed table '$table'"
+    elif echo "$response" | grep -q "does not exist"; then
+        log_warn "Table '$table' does not exist, skipping"
+    else
+        log_error "Failed to flush '$table': $response"
+    fi
+}
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -485,12 +539,13 @@ show_usage() {
     echo "Usage: $0 <command>"
     echo ""
     echo "Commands:"
-    echo "  setup    - Download and install QuestDB binaries"
-    echo "  start    - Start QuestDB server"
-    echo "  stop     - Stop QuestDB server"
-    echo "  restart  - Restart QuestDB server"
-    echo "  status   - Show QuestDB status"
-    echo "  logs     - Tail QuestDB logs"
+    echo "  setup        - Download and install QuestDB binaries"
+    echo "  start        - Start QuestDB server"
+    echo "  stop         - Stop QuestDB server"
+    echo "  restart      - Restart QuestDB server"
+    echo "  status       - Show QuestDB status"
+    echo "  logs         - Tail QuestDB logs"
+    echo "  flush <tbl>  - Truncate a table (trades, bootstrap_results, bootstrap_bounds, all)"
     echo ""
     echo "Directories:"
     echo "  Binary:  $BIN_DIR/questdb"
@@ -517,6 +572,9 @@ case "${1:-}" in
         ;;
     logs)
         do_logs
+        ;;
+    flush)
+        do_flush "$2"
         ;;
     *)
         show_usage

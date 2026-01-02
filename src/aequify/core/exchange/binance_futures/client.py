@@ -19,7 +19,7 @@ Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/gene
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import ccxt.pro as ccxtpro
@@ -29,7 +29,6 @@ from aequify.logging import get_logger
 from .models import (
     Order,
     OrderSide,
-    OrderType,
     Position,
 )
 from .rate_limiter import BinanceFuturesRateLimiter, RateLimitCallback, RateLimitState
@@ -119,7 +118,9 @@ class BinanceFuturesClient:
             # =============================================================================
             if self.config.demo:
                 self._exchange.enable_demo_trading(True)
-                self._exchange.options["fetchCurrencies"] = False  # Skip currency fetch for demo
+                self._exchange.options["fetchCurrencies"] = (
+                    False  # Skip currency fetch for demo
+                )
                 logger.info("Binance Futures client initialized (DEMO)")
             else:
                 logger.info("Binance Futures client initialized (LIVE)")
@@ -343,10 +344,14 @@ class BinanceFuturesClient:
                             await self._exchange.set_leverage(current_leverage, symbol)
                             self._update_rate_limits()
                             self._leverage_set.add(f"{symbol}|{current_leverage}")
-                            logger.info(f"Set leverage {current_leverage}x for {symbol} (minimum)")
+                            logger.info(
+                                f"Set leverage {current_leverage}x for {symbol} (minimum)"
+                            )
                             return current_leverage
                         except Exception as e2:
-                            logger.error(f"Failed to set even minimum leverage for {symbol}: {e2}")
+                            logger.error(
+                                f"Failed to set even minimum leverage for {symbol}: {e2}"
+                            )
                             raise
                 else:
                     # Other error, don't retry
@@ -375,7 +380,10 @@ class BinanceFuturesClient:
             # Ignore common errors:
             # - "No need to change" = already set
             # - "cannot be changed if there exists open orders" = has open orders/position
-            if "No need to change" not in error_str and "open orders" not in error_str.lower():
+            if (
+                "No need to change" not in error_str
+                and "open orders" not in error_str.lower()
+            ):
                 logger.warning(f"Failed to set margin type for {symbol}: {e}")
 
     async def prepare_symbol(self, symbol: str) -> None:
@@ -532,7 +540,9 @@ class BinanceFuturesClient:
         self._update_rate_limits()
 
         order = Order.from_ccxt(raw_order)
-        logger.info(f"Stop-Market {side.upper()} {amount} {symbol} @ {stop_price} -> {order.id}")
+        logger.info(
+            f"Stop-Market {side.upper()} {amount} {symbol} @ {stop_price} -> {order.id}"
+        )
         return order
 
     async def create_take_profit_market_order(
@@ -583,7 +593,9 @@ class BinanceFuturesClient:
         self._update_rate_limits()
 
         order = Order.from_ccxt(raw_order)
-        logger.info(f"TP-Market {side.upper()} {amount} {symbol} @ {stop_price} -> {order.id}")
+        logger.info(
+            f"TP-Market {side.upper()} {amount} {symbol} @ {stop_price} -> {order.id}"
+        )
         return order
 
     async def cancel_order(
@@ -734,14 +746,20 @@ class BinanceFuturesClient:
             # - List of orders directly: [{"algoId": ..., "symbol": ..., ...}, ...]
             # - Dict with code: {"code": 200, "msg": "OK", "data": {"orders": [...]}}
             if isinstance(response, list):
-                logger.debug(f"fetch_algo_open_orders({symbol}): got {len(response)} orders")
+                logger.debug(
+                    f"fetch_algo_open_orders({symbol}): got {len(response)} orders"
+                )
                 return response
             elif isinstance(response, dict):
                 if response.get("code") == 200:
                     orders = response.get("data", {}).get("orders", [])
-                    logger.debug(f"fetch_algo_open_orders({symbol}): got {len(orders)} orders")
+                    logger.debug(
+                        f"fetch_algo_open_orders({symbol}): got {len(orders)} orders"
+                    )
                     return orders
-                logger.debug(f"fetch_algo_open_orders({symbol}): code={response.get('code')}")
+                logger.debug(
+                    f"fetch_algo_open_orders({symbol}): code={response.get('code')}"
+                )
             return []
         except Exception as e:
             logger.warning(f"Failed to fetch algo orders for {symbol}: {e}")
@@ -902,7 +920,9 @@ class BinanceFuturesClient:
         entry_params = {"positionSide": "LONG"}
 
         # Entry order
-        entry = await self.create_market_order(symbol, "buy", amount, params=entry_params)
+        entry = await self.create_market_order(
+            symbol, "buy", amount, params=entry_params
+        )
 
         tp_order = None
         sl_order = None
@@ -910,7 +930,11 @@ class BinanceFuturesClient:
         # TP order (sell to close long) - same positionSide
         if take_profit and entry.filled > 0:
             tp_order = await self.create_take_profit_market_order(
-                symbol, "sell", entry.filled, take_profit, params={"positionSide": "LONG"}
+                symbol,
+                "sell",
+                entry.filled,
+                take_profit,
+                params={"positionSide": "LONG"},
             )
 
         # SL order (sell to close long) - same positionSide
@@ -947,7 +971,9 @@ class BinanceFuturesClient:
         entry_params = {"positionSide": "SHORT"}
 
         # Entry order
-        entry = await self.create_market_order(symbol, "sell", amount, params=entry_params)
+        entry = await self.create_market_order(
+            symbol, "sell", amount, params=entry_params
+        )
 
         tp_order = None
         sl_order = None
@@ -955,7 +981,11 @@ class BinanceFuturesClient:
         # TP order (buy to close short) - same positionSide
         if take_profit and entry.filled > 0:
             tp_order = await self.create_take_profit_market_order(
-                symbol, "buy", entry.filled, take_profit, params={"positionSide": "SHORT"}
+                symbol,
+                "buy",
+                entry.filled,
+                take_profit,
+                params={"positionSide": "SHORT"},
             )
 
         # SL order (buy to close short) - same positionSide
@@ -1012,3 +1042,221 @@ class BinanceFuturesClient:
                 logger.info(f"Position {symbol} already closed (no position to reduce)")
                 return None
             raise
+
+
+class SyncBinanceFuturesClient:
+    """
+    Synchronous wrapper for BinanceFuturesClient.
+
+    Uses aequify.runtime.IsolatedLoop to run async operations from sync code.
+    Useful for calling from Mojo or other sync contexts.
+
+    Usage:
+        from aequify.core.exchange.binance_futures import SyncBinanceFuturesClient, ClientConfig
+
+        config = ClientConfig(api_key="...", api_secret="...", demo=True)
+        client = SyncBinanceFuturesClient(config)
+        client.start()
+
+        try:
+            positions = client.get_positions()
+            order = client.create_market_order("BTC/USDT:USDT", "buy", 0.001)
+        finally:
+            client.stop()
+    """
+
+    def __init__(self, config: ClientConfig, timeout: float = 30.0) -> None:
+        """
+        Initialize sync client wrapper.
+
+        Args:
+            config: Client configuration.
+            timeout: Default timeout for operations in seconds.
+        """
+        from aequify.runtime import IsolatedLoop
+
+        self._config = config
+        self._timeout = timeout
+        self._loop = IsolatedLoop("aeq-ccxt-bnf")
+        self._client: BinanceFuturesClient | None = None
+
+    def start(self) -> None:
+        """Start the client and its isolated event loop."""
+        self._loop.start()
+        self._client = BinanceFuturesClient(self._config)
+        self._loop.run(self._client.initialize(), timeout=self._timeout)
+        logger.info("SyncBinanceFuturesClient started")
+
+    def stop(self) -> None:
+        """Stop the client and its isolated event loop."""
+        if self._client:
+            try:
+                self._loop.run(self._client.close(), timeout=self._timeout)
+            except Exception as e:
+                logger.warning(f"Error closing client: {e}")
+            self._client = None
+        self._loop.stop()
+        logger.info("SyncBinanceFuturesClient stopped")
+
+    def __enter__(self) -> "SyncBinanceFuturesClient":
+        """Context manager entry."""
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Context manager exit."""
+        self.stop()
+
+    def _ensure_running(self) -> BinanceFuturesClient:
+        """Ensure client is running."""
+        if not self._client or not self._loop.is_running:
+            raise RuntimeError("Client not started. Call start() first.")
+        return self._client
+
+    @property
+    def rate_limit_state(self) -> RateLimitState:
+        """Get current rate limit state."""
+        return self._ensure_running().rate_limit_state
+
+    def on_rate_limit_update(self, callback: RateLimitCallback) -> None:
+        """Register callback for rate limit updates."""
+        self._ensure_running().on_rate_limit_update(callback)
+
+    # =========================================================================
+    # Market Data
+    # =========================================================================
+
+    def fetch_tickers(self) -> dict[str, dict[str, Any]]:
+        """Fetch 24h tickers for all symbols."""
+        client = self._ensure_running()
+        return self._loop.run(client.fetch_tickers(), timeout=self._timeout)
+
+    def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+        """Fetch 24h ticker for a symbol."""
+        client = self._ensure_running()
+        return self._loop.run(client.fetch_ticker(symbol), timeout=self._timeout)
+
+    def fetch_orderbook(self, symbol: str, limit: int = 20) -> dict[str, Any]:
+        """Fetch orderbook for a symbol."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.fetch_orderbook(symbol, limit), timeout=self._timeout
+        )
+
+    # =========================================================================
+    # Account Data
+    # =========================================================================
+
+    def fetch_balance(self) -> dict[str, Any]:
+        """Fetch account balance."""
+        client = self._ensure_running()
+        return self._loop.run(client.fetch_balance(), timeout=self._timeout)
+
+    def fetch_positions(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
+        """Fetch open positions (raw dicts)."""
+        client = self._ensure_running()
+        return self._loop.run(client.fetch_positions(symbols), timeout=self._timeout)
+
+    def get_positions(self, symbols: list[str] | None = None) -> list[Position]:
+        """Fetch open positions as Position objects."""
+        client = self._ensure_running()
+        return self._loop.run(client.get_positions(symbols), timeout=self._timeout)
+
+    # =========================================================================
+    # Order Management
+    # =========================================================================
+
+    def create_market_order(
+        self,
+        symbol: str,
+        side: str | OrderSide,
+        amount: float,
+        reduce_only: bool = False,
+        params: dict[str, Any] | None = None,
+    ) -> Order:
+        """Create a market order."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.create_market_order(symbol, side, amount, reduce_only, params),
+            timeout=self._timeout,
+        )
+
+    def create_limit_order(
+        self,
+        symbol: str,
+        side: str | OrderSide,
+        amount: float,
+        price: float,
+        reduce_only: bool = False,
+        params: dict[str, Any] | None = None,
+    ) -> Order:
+        """Create a limit order."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.create_limit_order(symbol, side, amount, price, reduce_only, params),
+            timeout=self._timeout,
+        )
+
+    def cancel_order(self, order_id: str, symbol: str) -> Order:
+        """Cancel an order."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.cancel_order(order_id, symbol),
+            timeout=self._timeout,
+        )
+
+    def cancel_all_orders(self, symbol: str) -> list[Order]:
+        """Cancel all open orders for a symbol."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.cancel_all_orders(symbol),
+            timeout=self._timeout,
+        )
+
+    def fetch_open_orders(self, symbol: str | None = None) -> list[Order]:
+        """Fetch open orders."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.fetch_open_orders(symbol),
+            timeout=self._timeout,
+        )
+
+    # =========================================================================
+    # Convenience Methods
+    # =========================================================================
+
+    def open_long(
+        self,
+        symbol: str,
+        amount: float,
+        take_profit: float | None = None,
+        stop_loss: float | None = None,
+    ) -> tuple[Order, Order | None, Order | None]:
+        """Open a long position with optional TP/SL."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.open_long(symbol, amount, take_profit, stop_loss),
+            timeout=self._timeout,
+        )
+
+    def open_short(
+        self,
+        symbol: str,
+        amount: float,
+        take_profit: float | None = None,
+        stop_loss: float | None = None,
+    ) -> tuple[Order, Order | None, Order | None]:
+        """Open a short position with optional TP/SL."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.open_short(symbol, amount, take_profit, stop_loss),
+            timeout=self._timeout,
+        )
+
+    def close_position(self, symbol: str) -> Order | None:
+        """Close entire position for a symbol."""
+        client = self._ensure_running()
+        return self._loop.run(
+            client.close_position(symbol),
+            timeout=self._timeout,
+        )

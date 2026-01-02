@@ -3,7 +3,6 @@ APEX Chart Pane widget.
 
 Displays real-time APEX analysis visualization for the selected symbol:
 - Optimized parameters from GPU bootstrap (with TP/SL, win rate, entries)
-- Session Levels for dynamic TP/DCA zones
 - Volume Imbalance bar with LONG/SHORT trigger zones (price-based, footprint style)
 - Price Movement from High/Low combined view
 - Signal readiness checklist
@@ -11,9 +10,7 @@ Displays real-time APEX analysis visualization for the selected symbol:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from dataclasses import dataclass
 
 from rich.console import Group
 from rich.panel import Panel
@@ -27,175 +24,158 @@ from textual.widgets import Static
 from aequify.tui.widgets.theme_colors import ThemeColorsMixin
 
 
-# ============================================================================
-# Mock classes for TUI development - TODO: Replace with real engine imports
-# ============================================================================
+# =============================================================================
+# Data Structures for TUI State
+# =============================================================================
 
 
 @dataclass
 class OptimizedParams:
-    """Mock optimized parameters from bootstrap."""
+    """Optimized parameters for a single direction (LONG or SHORT)."""
 
-    price_move: float = -2.5
-    time_window: int = 30000
-    delta_threshold: float = -50.0
-    dca_distance_pct: float = -3.0
-    target_profit: float = 1.5
-    stop_loss: float = 5.0
-    max_hold_time_ms: int = 3600000
-    win_rate: float = 0.65
-    entries: int = 150
-    avg_pnl: float = 0.8
+    # Signal parameters
+    price_move: float = 0.0  # Trigger threshold %
+    time_window: int = 30000  # Lookback window in ms
+    delta_threshold: float = 0.0  # Volume delta trigger %
 
+    # Position parameters (TP is fallback - session levels used at runtime)
+    target_profit: float = 1.5  # Fallback TP % (used when no session levels)
+    stop_loss: float = 5.0  # SL %
 
-class LevelType(Enum):
-    """Session level type."""
+    # Backtest results
+    win_rate: float = 0.0  # 0-1
+    entries: int = 0  # Number of entries in backtest
+    avg_pnl: float = 0.0  # Average PnL per trade %
 
-    POC = "POC"
-    IMBALANCE = "IMB"
-    VAH = "VAH"
-    VAL = "VAL"
+    # Max hold time
+    max_hold_time_ms: int = 3600000  # Max hold time in ms (default 1hr)
 
-
-@dataclass
-class SessionLevel:
-    """Mock session level for TP/DCA zones."""
-
-    price: float
-    level_type: LevelType
-    session: str
-    is_unfilled: bool = True
-
-    def distance_from_price(self, current_price: float) -> float:
-        if current_price == 0:
-            return 0.0
-        return ((self.price - current_price) / current_price) * 100
-
-
-@dataclass
-class SessionLevelCache:
-    """Mock session level cache."""
-
-    levels: list[SessionLevel] = field(default_factory=list)
-    tp_levels_long: list[SessionLevel] = field(default_factory=list)
-    tp_levels_short: list[SessionLevel] = field(default_factory=list)
-    dca_levels_long: list[SessionLevel] = field(default_factory=list)
-    dca_levels_short: list[SessionLevel] = field(default_factory=list)
-
-    @classmethod
-    def mock(cls, current_price: float = 100.0) -> "SessionLevelCache":
-        """Create mock session levels for testing."""
-        levels = [
-            SessionLevel(current_price * 1.02, LevelType.POC, "Asia"),
-            SessionLevel(current_price * 1.035, LevelType.VAH, "London"),
-            SessionLevel(current_price * 0.98, LevelType.VAL, "Asia"),
-            SessionLevel(current_price * 0.965, LevelType.IMBALANCE, "NY"),
-        ]
-        return cls(
-            levels=levels,
-            tp_levels_long=[l for l in levels if l.price > current_price],
-            tp_levels_short=[l for l in levels if l.price < current_price],
-            dca_levels_long=[l for l in levels if l.price < current_price],
-            dca_levels_short=[l for l in levels if l.price > current_price],
-        )
+    # DCA parameters
+    dca_distance_pct: float = -5.0  # Min DCA distance % (neg for LONG, pos for SHORT)
 
 
 @dataclass
 class APEXTUIState:
-    """Mock APEX TUI state for development."""
+    """
+    Immutable state snapshot for TUI visualization.
 
-    # Bootstrap state
-    is_bootstrapped: bool = True
-    source: str = "cached"
+    Contains all data needed to render the APEX chart pane:
+    - Optimized parameters from GPU bootstrap
+    - Real-time rolling calculations
+    - Signal status
+    """
+
+    # Bootstrap status
+    is_bootstrapped: bool = False
+    source: str = "none"  # "gpu", "cached", "none"
+
+    # Optimized parameters (from bootstrap)
     long_params: OptimizedParams | None = None
     short_params: OptimizedParams | None = None
 
-    # Backfill progress
-    backfill_status: str = ""
-    backfill_progress: float = 0.0
-    backfill_current_day: int = 0
-    backfill_total_days: int = 0
+    # Real-time values (from rolling window)
+    current_price: float = 0.0
+    rolling_high: float = 0.0
+    rolling_low: float = 0.0
+    rolling_high_ts: int = 0  # Timestamp when rolling high was established
+    rolling_low_ts: int = 0  # Timestamp when rolling low was established
 
-    # Price data
-    current_price: float = 100.0
-    rolling_high: float = 102.0
-    rolling_low: float = 98.0
-    price_move_from_high: float = -1.96
-    price_move_from_low: float = 2.04
-    price_window: int = 30000
+    # Volume deltas calculated FROM high/low timestamps (not fixed window)
+    # LONG: delta from when high was established (selling pressure since high)
+    # SHORT: delta from when low was established (buying pressure since low)
+    long_volume_delta: float = 0.0  # -100 to +100, calculated from rolling_high_ts
+    short_volume_delta: float = 0.0  # -100 to +100, calculated from rolling_low_ts
 
-    # Volume delta
-    long_volume_delta: float = -35.0
-    short_volume_delta: float = 25.0
-    imbalance_price_pct: float = 0.1
+    # Calculated price moves
+    price_move_from_high: float = 0.0  # Negative when price dropped
+    price_move_from_low: float = 0.0  # Positive when price rose
 
-    # Signal state
+    # Trade counts
+    trade_count: int = 0
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+
+    # Signal status (using optimized thresholds)
     long_signal_ready: bool = False
     short_signal_ready: bool = False
-    long_signal_offset: float = 0.0
-    short_signal_offset: float = 0.0
 
-    # Position state
+    # Config bounds (for reference display)
+    price_window: int = 3000  # ms
+    imbalance_price_pct: float = 1.0  # % price tolerance for imbalance calc
+
+    # Signal entry offset (triggers slightly before threshold)
+    long_signal_offset: float = 0.0  # LONG triggers at (threshold + offset)
+    short_signal_offset: float = 0.0  # SHORT triggers at (threshold - offset)
+
+    # Backfill status (for TUI display during initialization)
+    backfill_status: str = ""  # e.g., "Downloading 2024-12-25...", "Importing...", ""
+    backfill_progress: int = 0  # 0-100 percentage
+    backfill_total_days: int = 0  # Total days to download
+    backfill_current_day: int = 0  # Current day being processed
+
+    # Position status (for DCA eligibility display in TUI)
+    # LONG position
     has_long_position: bool = False
-    has_short_position: bool = False
-    long_position_size: float = 0.0
-    short_position_size: float = 0.0
-    long_position_entry: float = 0.0
-    short_position_entry: float = 0.0
-    long_price_from_entry: float = 0.0
-    short_price_from_entry: float = 0.0
-    long_max_position_size: float = 1000.0
-    short_max_position_size: float = 1000.0
+    long_position_entry: float = 0.0  # Average entry price
+    long_position_size: float = 0.0  # Position size in USDT
+    long_price_from_entry: float = 0.0  # Current price vs entry %
+    long_dca_eligible: bool = False  # True if price dropped enough for DCA
 
-    # Trade count
-    trade_count: int = 0
+    # SHORT position
+    has_short_position: bool = False
+    short_position_entry: float = 0.0  # Average entry price
+    short_position_size: float = 0.0  # Position size in USDT
+    short_price_from_entry: float = 0.0  # Current price vs entry %
+    short_dca_eligible: bool = False  # True if price rose enough for DCA
+
+    # Max position sizes (for TUI "Can DCA" display)
+    long_max_position_size: float = 180.0  # From trading config
+    short_max_position_size: float = 180.0  # From trading config
 
     def long_trigger_threshold(self) -> float:
-        base = self.long_params.price_move if self.long_params else -2.0
-        return base + self.long_signal_offset
+        """Get effective LONG trigger threshold (with offset applied)."""
+        if self.long_params is None:
+            return 0.0
+        return self.long_params.price_move + self.long_signal_offset
 
     def short_trigger_threshold(self) -> float:
-        base = self.short_params.price_move if self.short_params else 2.0
-        return base - self.short_signal_offset
+        """Get effective SHORT trigger threshold (with offset applied)."""
+        if self.short_params is None:
+            return 0.0
+        return self.short_params.price_move - self.short_signal_offset
 
-    @classmethod
-    def mock(cls) -> "APEXTUIState":
-        """Create mock state with sample data."""
-        return cls(
-            is_bootstrapped=True,
-            source="cached",
-            long_params=OptimizedParams(
-                price_move=-2.5,
-                delta_threshold=-50.0,
-                target_profit=1.5,
-                stop_loss=5.0,
-                win_rate=0.65,
-                entries=150,
-                avg_pnl=0.8,
-            ),
-            short_params=OptimizedParams(
-                price_move=2.5,
-                delta_threshold=50.0,
-                target_profit=1.5,
-                stop_loss=5.0,
-                win_rate=0.62,
-                entries=140,
-                avg_pnl=0.7,
-            ),
-            current_price=100.0,
-            rolling_high=102.0,
-            rolling_low=98.0,
-            price_move_from_high=-1.96,
-            price_move_from_low=2.04,
-            long_volume_delta=-35.0,
-            short_volume_delta=25.0,
-            trade_count=1250,
-        )
+    def long_pm_progress(self) -> float:
+        """Progress towards LONG price move trigger (0-1, 1=triggered)."""
+        if self.long_params is None or self.price_move_from_high >= 0:
+            return 0.0
+        # Use effective trigger threshold (with offset)
+        trigger = self.long_trigger_threshold()
+        return min(1.0, abs(self.price_move_from_high) / abs(trigger)) if trigger != 0 else 0.0
+
+    def short_pm_progress(self) -> float:
+        """Progress towards SHORT price move trigger (0-1, 1=triggered)."""
+        if self.short_params is None or self.price_move_from_low <= 0:
+            return 0.0
+        # Use effective trigger threshold (with offset)
+        trigger = self.short_trigger_threshold()
+        return min(1.0, self.price_move_from_low / trigger) if trigger != 0 else 0.0
+
+    def long_delta_progress(self) -> float:
+        """Progress towards LONG delta trigger (0-1, 1=triggered)."""
+        if self.long_params is None or self.long_volume_delta >= 0:
+            return 0.0
+        return min(1.0, abs(self.long_volume_delta) / abs(self.long_params.delta_threshold))
+
+    def short_delta_progress(self) -> float:
+        """Progress towards SHORT delta trigger (0-1, 1=triggered)."""
+        if self.short_params is None or self.short_volume_delta <= 0:
+            return 0.0
+        return min(1.0, self.short_volume_delta / self.short_params.delta_threshold)
 
 
-# ============================================================================
-# End mock classes
-# ============================================================================
+# =============================================================================
+# APEX Chart Pane Widget
+# =============================================================================
 
 
 class APEXChartPane(VerticalScroll, ThemeColorsMixin):
@@ -204,7 +184,6 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
 
     Shows:
     - Optimized parameters from GPU bootstrap (TP, SL, win rate, entries)
-    - Session Levels (unfilled POC/imbalance levels for TP/DCA)
     - Volume Imbalance with LONG/SHORT zones (price-based, footprint style)
     - Price Movement combined view
     - Signal readiness checklist
@@ -250,7 +229,6 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
     ) -> None:
         super().__init__(name=name, id=id, classes=classes, disabled=disabled)
         self._state: APEXTUIState | None = None
-        self._session_levels: SessionLevelCache | None = None
         self._selected_symbol: str | None = None
 
     def compose(self) -> ComposeResult:
@@ -336,19 +314,15 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
         sections.append(self._build_optimized_params_section(state))
         sections.append(Text())  # Spacer
 
-        # 2. Session Levels Section (TP/DCA zones from continuous learning)
-        sections.append(self._build_session_levels_section())
-        sections.append(Text())  # Spacer
-
-        # 3. Volume Delta Section
+        # 2. Volume Delta Section
         sections.append(self._build_delta_section(state))
         sections.append(Text())  # Spacer
 
-        # 4. Price Movement Section (combined LONG/SHORT)
+        # 3. Price Movement Section (combined LONG/SHORT)
         sections.append(self._build_price_movement_section(state))
         sections.append(Text())  # Spacer
 
-        # 5. Signal Readiness (checklist format)
+        # 4. Signal Readiness (checklist format)
         sections.append(self._build_signal_readiness(state))
 
         return Group(*sections)
@@ -485,124 +459,6 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
             table,
             title=f"Bootstrap Parameters ({state.source})",
             border_style=accent if state.source == "cached" else secondary,
-        )
-
-    def _build_session_levels_section(self) -> Panel:
-        """Build Session Levels section showing TP/DCA zones from continuous learning."""
-        colors = self._get_theme_colors_dict()
-        success = colors["success"]
-        error = colors["error"]
-        warning = colors["warning"]
-        accent = colors["accent"]
-        secondary = colors["secondary"]
-        muted = colors["muted"]
-
-        if self._session_levels is None or not self._session_levels.levels:
-            content = Text()
-            content.append("No session levels computed yet.\n", style=f"{muted} italic")
-            content.append("Session levels provide dynamic TP/DCA zones\n", style=muted)
-            content.append("based on unfilled POC and imbalance levels.", style=muted)
-            return Panel(content, title="Session Levels", border_style=muted)
-
-        cache = self._session_levels
-        current_price = self._state.current_price if self._state else 0.0
-
-        # Create side-by-side table for LONG and SHORT zones
-        table = Table.grid(padding=(0, 2))
-        table.add_column(width=32)  # LONG column
-        table.add_column(width=2)  # Separator
-        table.add_column(width=32)  # SHORT column
-
-        # Build LONG zones column
-        long_text = Text()
-        long_text.append("LONG ZONES", style=f"bold {error} underline")
-        long_text.append("\n")
-
-        # TP zones (levels above current price)
-        long_text.append("  Take Profit:\n", style=f"{success} bold")
-        if cache.tp_levels_long:
-            for i, level in enumerate(cache.tp_levels_long[:3]):  # Show top 3
-                distance = level.distance_from_price(current_price)
-                session_short = level.session[:3]  # Abbreviate session name
-                long_text.append(f"    {level.price:.4f}", style=success)
-                long_text.append(f" (+{distance:.1f}%)", style=muted)
-                long_text.append(f" {session_short}", style=f"{accent} {muted}")
-                long_text.append(f" {level.level_type.value}\n", style=muted)
-        else:
-            long_text.append("    None available\n", style=f"{muted} italic")
-
-        # DCA zones (levels below current price)
-        long_text.append("  DCA Zones:\n", style=f"{secondary} bold")
-        if cache.dca_levels_long:
-            for i, level in enumerate(cache.dca_levels_long[:3]):  # Show top 3
-                distance = level.distance_from_price(current_price)
-                session_short = level.session[:3]
-                long_text.append(f"    {level.price:.4f}", style=secondary)
-                long_text.append(f" ({distance:.1f}%)", style=muted)
-                long_text.append(f" {session_short}", style=f"{accent} {muted}")
-                long_text.append(f" {level.level_type.value}\n", style=muted)
-        else:
-            long_text.append("    None available\n", style=f"{muted} italic")
-
-        # Build SHORT zones column
-        short_text = Text()
-        short_text.append("SHORT ZONES", style=f"bold {success} underline")
-        short_text.append("\n")
-
-        # TP zones (levels below current price)
-        short_text.append("  Take Profit:\n", style=f"{success} bold")
-        if cache.tp_levels_short:
-            for i, level in enumerate(cache.tp_levels_short[:3]):  # Show top 3
-                distance = level.distance_from_price(current_price)
-                session_short = level.session[:3]
-                short_text.append(f"    {level.price:.4f}", style=success)
-                short_text.append(f" ({distance:.1f}%)", style=muted)
-                short_text.append(f" {session_short}", style=f"{accent} {muted}")
-                short_text.append(f" {level.level_type.value}\n", style=muted)
-        else:
-            short_text.append("    None available\n", style=f"{muted} italic")
-
-        # DCA zones (levels above current price)
-        short_text.append("  DCA Zones:\n", style=f"{secondary} bold")
-        if cache.dca_levels_short:
-            for i, level in enumerate(cache.dca_levels_short[:3]):  # Show top 3
-                distance = level.distance_from_price(current_price)
-                session_short = level.session[:3]
-                short_text.append(f"    {level.price:.4f}", style=secondary)
-                short_text.append(f" (+{distance:.1f}%)", style=muted)
-                short_text.append(f" {session_short}", style=f"{accent} {muted}")
-                short_text.append(f" {level.level_type.value}\n", style=muted)
-        else:
-            short_text.append("    None available\n", style=f"{muted} italic")
-
-        # Separator
-        sep_text = Text("│\n│\n│\n│\n│\n│\n│\n│", style=muted)
-
-        table.add_row(long_text, sep_text, short_text)
-
-        # Summary footer
-        total_unfilled = len([l for l in cache.levels if l.is_unfilled])
-        total_levels = len(cache.levels)
-        footer = Text()
-        footer.append(f"\n  {total_unfilled}/{total_levels} unfilled levels", style=muted)
-        if current_price > 0:
-            footer.append(f"  │  Current: {current_price:.4f}", style=muted)
-
-        # Determine border style
-        has_tp = bool(cache.tp_levels_long or cache.tp_levels_short)
-        has_dca = bool(cache.dca_levels_long or cache.dca_levels_short)
-
-        if has_tp and has_dca:
-            border = accent
-        elif has_tp or has_dca:
-            border = secondary
-        else:
-            border = muted
-
-        return Panel(
-            Group(table, footer),
-            title="Session Levels",
-            border_style=border,
         )
 
     def _build_delta_section(self, state: APEXTUIState) -> Panel:
@@ -1205,29 +1061,21 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
             border_style=border,
         )
 
+    # =========================================================================
+    # Public API - Called from App via PubSub
+    # =========================================================================
+
     def update_state(self, state: APEXTUIState) -> None:
         """
         Update with new TUI state.
 
-        Called from APEXManager via app.
+        Called from App when PubSub messages are received.
 
         Args:
             state: New TUI state snapshot.
         """
         self._state = state
         self.trade_count = state.trade_count
-        self._update_content()
-
-    def update_session_levels(self, session_levels: SessionLevelCache) -> None:
-        """
-        Update with new session levels.
-
-        Called from APEXManager via app.
-
-        Args:
-            session_levels: New session level cache.
-        """
-        self._session_levels = session_levels
         self._update_content()
 
     def set_symbol(self, symbol: str | None) -> None:
@@ -1240,7 +1088,6 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
         if symbol != self._selected_symbol:
             self._selected_symbol = symbol
             self._state = None
-            self._session_levels = None
             self.trade_count = 0
             self.is_active = False
             self._update_status()
@@ -1254,7 +1101,6 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
         """Clear all state."""
         self._selected_symbol = None
         self._state = None
-        self._session_levels = None
         self.trade_count = 0
         self.is_active = False
         self._update_status()

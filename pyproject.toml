@@ -12,10 +12,15 @@ dependencies = [
     "httpx>=0.28.1",
     "ccxt>=4.5.30",
     "psutil>=7.2.1",
-    "pynvml>=13.0.1",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.12.0",
     "pyyaml>=6.0.3",
+    "asyncpg>=0.31.0",
+    "questdb>=4.1.0",
+    "pandas>=2.3.3",
+    "nvidia-ml-py>=13.590.44",
+    "numpy>=2.4.0",
+    "python-dotenv>=1.2.1",
 ]
 
 [build-system]

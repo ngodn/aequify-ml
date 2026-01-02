@@ -32,6 +32,7 @@ run = "uv sync --all-extras"
 
 [tasks.aequify]
 description = "Run Aequify TUI"
+depends = ["cleancache"]
 run = """
 #!/usr/bin/env bash
 # Ensure QuestDB is running
@@ -99,3 +100,23 @@ run = "./helper/questdb.sh status"
 [tasks."questdb:logs"]
 description = "Tail QuestDB logs"
 run = "./helper/questdb.sh logs"
+
+[tasks."questdb:flush"]
+description = "Show flush usage"
+run = "./helper/questdb.sh flush"
+
+[tasks."questdb:flush:trades"]
+description = "Flush trades table"
+run = "./helper/questdb.sh flush trades"
+
+[tasks."questdb:flush:bootstrap_results"]
+description = "Flush bootstrap_results table"
+run = "./helper/questdb.sh flush bootstrap_results"
+
+[tasks."questdb:flush:bootstrap_bounds"]
+description = "Flush bootstrap_bounds table"
+run = "./helper/questdb.sh flush bootstrap_bounds"
+
+[tasks."questdb:flush:all"]
+description = "Flush all tables"
+run = "./helper/questdb.sh flush all"

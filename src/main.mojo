@@ -66,46 +66,18 @@ fn print_startup_info() raises:
         print("GPU: " + vendor)
         try:
             var gpu = GPUContext()
-            print("  Name: " + gpu.device_name())
-            var arch = gpu.arch_name()
-            print("  Arch: " + arch)
-            # Compute units: Apple/AMD use compile-time values, NVIDIA uses DeviceAttribute
+            var info = gpu.to_dict()
+            print("  Name: " + String(info[PythonObject("name")]))
+            print("  Arch: " + String(info[PythonObject("arch")]))
+            # Use multiprocessor_count from to_dict() which handles all vendors
+            var mp_count = Int(info[PythonObject("multiprocessor_count")])
             @parameter
             if has_apple_gpu_accelerator():
-                var gpu_cores = 8  # Default for M1
-                if arch == "apple-m2" or arch == "apple-m3" or arch == "apple-m4" or arch == "apple-m5":
-                    gpu_cores = 10
-                print("  Cores: " + String(gpu_cores))
+                print("  Cores: " + String(mp_count))
             elif has_amd_gpu_accelerator():
-                # AMD CU count from arch_name
-                var cu_count = 0
-                if arch == "gfx942":
-                    cu_count = 304  # MI300X
-                elif arch == "gfx950":
-                    cu_count = 256  # MI355X
-                elif arch == "gfx1030":
-                    cu_count = 60   # Radeon 6900
-                elif arch == "gfx1100":
-                    cu_count = 96   # Radeon 7900
-                elif arch == "gfx1101":
-                    cu_count = 60   # Radeon 7800/7700
-                elif arch == "gfx1102":
-                    cu_count = 32   # Radeon 7600
-                elif arch == "gfx1103":
-                    cu_count = 12   # Radeon 780M
-                elif arch == "gfx1150":
-                    cu_count = 12   # Radeon 880M
-                elif arch == "gfx1151":
-                    cu_count = 40   # Radeon 8060S
-                elif arch == "gfx1152":
-                    cu_count = 8    # Radeon 860M
-                elif arch == "gfx1200":
-                    cu_count = 32   # Radeon 9060
-                elif arch == "gfx1201":
-                    cu_count = 64   # Radeon 9070
-                print("  CUs: " + String(cu_count))
+                print("  CUs: " + String(mp_count))
             else:
-                print("  SMs: " + String(gpu.multiprocessor_count()))
+                print("  SMs: " + String(mp_count))
             print("  Memory: " + String(Int(gpu.total_memory_gb() * 10) / 10.0) + " GB")
         except:
             print("  (could not get GPU info)")
