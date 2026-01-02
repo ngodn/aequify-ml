@@ -24,7 +24,7 @@ filters:
   - name: absolute_price_percentage_change
     enabled: true
     config:
-      top: 20
+      top: 2
   - name: symbol_filter
     enabled: true
     config:
