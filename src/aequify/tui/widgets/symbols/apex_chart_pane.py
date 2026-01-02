@@ -230,6 +230,7 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
         super().__init__(name=name, id=id, classes=classes, disabled=disabled)
         self._state: APEXTUIState | None = None
         self._selected_symbol: str | None = None
+        self._state_cache: dict[str, APEXTUIState] = {}  # Per-symbol state cache
 
     def compose(self) -> ComposeResult:
         yield Static("", id="apex-status")
@@ -1076,6 +1077,9 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
         """
         self._state = state
         self.trade_count = state.trade_count
+        # Cache state for this symbol so it persists when switching symbols
+        if self._selected_symbol:
+            self._state_cache[self._selected_symbol] = state
         self._update_content()
 
     def set_symbol(self, symbol: str | None) -> None:
@@ -1086,9 +1090,20 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
             symbol: Symbol to show, or None to clear.
         """
         if symbol != self._selected_symbol:
+            # Save current state to cache before switching
+            if self._selected_symbol and self._state:
+                self._state_cache[self._selected_symbol] = self._state
+
             self._selected_symbol = symbol
-            self._state = None
-            self.trade_count = 0
+
+            # Restore state from cache if available, otherwise start fresh
+            if symbol and symbol in self._state_cache:
+                self._state = self._state_cache[symbol]
+                self.trade_count = self._state.trade_count
+            else:
+                self._state = None
+                self.trade_count = 0
+
             self.is_active = False
             self._update_status()
             self._update_content()
@@ -1098,10 +1113,22 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
         self.is_active = active
 
     def clear(self) -> None:
-        """Clear all state."""
+        """Clear current display state (cache is preserved)."""
         self._selected_symbol = None
         self._state = None
         self.trade_count = 0
         self.is_active = False
         self._update_status()
         self._update_content()
+
+    def clear_cache(self, symbol: str | None = None) -> None:
+        """
+        Clear cached state.
+
+        Args:
+            symbol: Specific symbol to clear, or None to clear all.
+        """
+        if symbol:
+            self._state_cache.pop(symbol, None)
+        else:
+            self._state_cache.clear()

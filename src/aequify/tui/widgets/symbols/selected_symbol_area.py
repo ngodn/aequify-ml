@@ -17,9 +17,10 @@ from textual.widgets import Static, TabPane
 
 from aequify.tui.widgets.symbols.apex_chart_pane import APEXChartPane
 from aequify.tui.widgets.symbols.browser import SymbolData
-from aequify.tui.widgets.symbols.positions_pane import PositionsPane
-from aequify.tui.widgets.symbols.symbol_info import MarketInfo, SymbolInfoPane
-from aequify.tui.widgets.symbols.trade_stream_pane import TradeStreamPane
+# TODO: Disabled rtds@position and rtds@trade panes - TUI state management needs redesign
+# from aequify.tui.widgets.symbols.positions_pane import PositionsPane
+from aequify.tui.widgets.symbols.symbol_info import MarketInfo, SymbolInfoPane  # noqa: F401
+# from aequify.tui.widgets.symbols.trade_stream_pane import TradeStreamPane
 from aequify.tui.widgets.tabbed_content import AequifyTabbedContent
 
 
@@ -86,10 +87,11 @@ class SelectedSymbolArea(Vertical):
         with SelectedSymbolTabbedContent(id="symbol-tabs"):
             with TabPane("Symbol Info", id="symbol-info-pane"):
                 yield SymbolInfoPane(id="symbol-info")
-            with TabPane("RTDS:@position", id="positions-pane"):
-                yield PositionsPane(id="positions")
-            with TabPane("RTDS:@trade", id="trade-stream-pane"):
-                yield TradeStreamPane(id="trade-stream")
+            # TODO: Disabled rtds@position and rtds@trade panes - TUI state management needs redesign
+            # with TabPane("RTDS:@position", id="positions-pane"):
+            #     yield PositionsPane(id="positions")
+            # with TabPane("RTDS:@trade", id="trade-stream-pane"):
+            #     yield TradeStreamPane(id="trade-stream")
             with TabPane("Engine: APEX", id="apex-chart-pane"):
                 yield APEXChartPane(id="apex-chart")
 
@@ -106,17 +108,17 @@ class SelectedSymbolArea(Vertical):
         if symbol:
             self.border_title = f"Symbol: {symbol.display_name}"
             self._load_symbol_info(symbol)
-            # Update positions filtered by selected symbol
-            self.positions_pane.set_symbol(symbol.symbol)
-            # Update trade stream to filter by selected symbol
-            self.trade_stream_pane.set_symbol(symbol.symbol)
+            # TODO: Disabled rtds@position and rtds@trade panes
+            # self.positions_pane.set_symbol(symbol.symbol)
+            # self.trade_stream_pane.set_symbol(symbol.symbol)
             # Update APEX chart to filter by selected symbol
             self.apex_chart_pane.set_symbol(symbol.symbol)
         else:
             self.border_title = "Selected Symbol"
             self.symbol_info_pane.clear()
-            self.positions_pane.set_symbol(None)
-            self.trade_stream_pane.set_symbol(None)
+            # TODO: Disabled rtds@position and rtds@trade panes
+            # self.positions_pane.set_symbol(None)
+            # self.trade_stream_pane.set_symbol(None)
             self.apex_chart_pane.set_symbol(None)
 
     def _update_display(self) -> None:
@@ -153,16 +155,17 @@ class SelectedSymbolArea(Vertical):
             market = markets.get(self.selected_symbol.symbol)
             self.symbol_info_pane.update_from_symbol(self.selected_symbol, market)
 
-    def update_positions(self, positions: list[dict[str, Any]]) -> None:
-        """
-        Update the positions display (from REST API or WebSocket).
-
-        Args:
-            positions: List of position dicts from fetch_positions() or watch_positions()
-        """
-        self._positions_cache = positions
-        # PositionsPane handles filtering internally via set_symbol
-        self.positions_pane.update_positions(positions)
+    # TODO: Disabled rtds@position pane
+    # def update_positions(self, positions: list[dict[str, Any]]) -> None:
+    #     """
+    #     Update the positions display (from REST API or WebSocket).
+    #
+    #     Args:
+    #         positions: List of position dicts from fetch_positions() or watch_positions()
+    #     """
+    #     self._positions_cache = positions
+    #     # PositionsPane handles filtering internally via set_symbol
+    #     self.positions_pane.update_positions(positions)
 
     def select_symbol(self, symbol: SymbolData) -> None:
         """
@@ -182,15 +185,16 @@ class SelectedSymbolArea(Vertical):
         """Get the symbol info pane."""
         return self.query_one("#symbol-info", SymbolInfoPane)
 
-    @property
-    def positions_pane(self) -> PositionsPane:
-        """Get the positions pane."""
-        return self.query_one("#positions", PositionsPane)
+    # TODO: Disabled rtds@position and rtds@trade panes
+    # @property
+    # def positions_pane(self) -> PositionsPane:
+    #     """Get the positions pane."""
+    #     return self.query_one("#positions", PositionsPane)
 
-    @property
-    def trade_stream_pane(self) -> TradeStreamPane:
-        """Get the trade stream pane."""
-        return self.query_one("#trade-stream", TradeStreamPane)
+    # @property
+    # def trade_stream_pane(self) -> TradeStreamPane:
+    #     """Get the trade stream pane."""
+    #     return self.query_one("#trade-stream", TradeStreamPane)
 
     @property
     def apex_chart_pane(self) -> APEXChartPane:

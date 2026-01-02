@@ -677,8 +677,9 @@ class Aequify(App):
         """Handle positions update from PubSub."""
         try:
             positions = message.data.get("positions", [])
-            selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
-            selected_area.update_positions(positions)
+            # TODO: Disabled rtds@position pane - TUI state management needs redesign
+            # selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
+            # selected_area.update_positions(positions)
 
             # Update symbol browser with position info
             symbol_browser = self.query_one("#symbol-browser", SymbolBrowser)
@@ -700,41 +701,43 @@ class Aequify(App):
 
     def on_trading_trade_update(self, message: TradingTradeUpdate) -> None:
         """Handle trade update from PubSub."""
-        try:
-            selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
-            trade_pane = selected_area.trade_stream_pane
-
-            # Handle single trade
-            trade = message.data.get("trade")
-            if trade:
-                # Convert to format expected by TradeStreamPane
-                trade_data = {
-                    "trade_id": int(trade.get("id", 0)),
-                    "symbol": message.symbol,
-                    "price": float(trade.get("price", 0)),
-                    "quantity": float(trade.get("amount", 0)),
-                    "timestamp_ms": int(trade.get("timestamp", 0)),
-                    "is_buyer_maker": trade.get("side") == "sell",
-                }
-                trade_pane.add_trade(trade_data)
-                trade_pane.set_streaming(True)
-
-            # Handle batch of trades
-            trades = message.data.get("trades", [])
-            for trade in trades:
-                trade_data = {
-                    "trade_id": int(trade.get("id", 0)),
-                    "symbol": message.symbol,
-                    "price": float(trade.get("price", 0)),
-                    "quantity": float(trade.get("amount", 0)),
-                    "timestamp_ms": int(trade.get("timestamp", 0)),
-                    "is_buyer_maker": trade.get("side") == "sell",
-                }
-                trade_pane.add_trade(trade_data)
-            if trades:
-                trade_pane.set_streaming(True)
-        except Exception as e:
-            logger.debug(f"Error handling trade update: {e}")
+        # TODO: Disabled rtds@trade pane - TUI state management needs redesign
+        pass
+        # try:
+        #     selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
+        #     trade_pane = selected_area.trade_stream_pane
+        #
+        #     # Handle single trade
+        #     trade = message.data.get("trade")
+        #     if trade:
+        #         # Convert to format expected by TradeStreamPane
+        #         trade_data = {
+        #             "trade_id": int(trade.get("id", 0)),
+        #             "symbol": message.symbol,
+        #             "price": float(trade.get("price", 0)),
+        #             "quantity": float(trade.get("amount", 0)),
+        #             "timestamp_ms": int(trade.get("timestamp", 0)),
+        #             "is_buyer_maker": trade.get("side") == "sell",
+        #         }
+        #         trade_pane.add_trade(trade_data)
+        #         trade_pane.set_streaming(True)
+        #
+        #     # Handle batch of trades
+        #     trades = message.data.get("trades", [])
+        #     for trade in trades:
+        #         trade_data = {
+        #             "trade_id": int(trade.get("id", 0)),
+        #             "symbol": message.symbol,
+        #             "price": float(trade.get("price", 0)),
+        #             "quantity": float(trade.get("amount", 0)),
+        #             "timestamp_ms": int(trade.get("timestamp", 0)),
+        #             "is_buyer_maker": trade.get("side") == "sell",
+        #         }
+        #         trade_pane.add_trade(trade_data)
+        #     if trades:
+        #         trade_pane.set_streaming(True)
+        # except Exception as e:
+        #     logger.debug(f"Error handling trade update: {e}")
 
     def on_trading_symbols_update(self, message: TradingSymbolsUpdate) -> None:
         """Handle symbols update from PubSub."""
@@ -805,14 +808,12 @@ class Aequify(App):
             api_info.position_stream_connected = message.data.get("position_stream_connected", False)
             api_info.binance_uid = message.data.get("binance_uid", 0)
 
-            # Update selected symbol area panes with streaming status
-            selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
-            position_connected = message.data.get("position_stream_connected", False)
-            selected_area.positions_pane.set_streaming(position_connected)
-
-            # Trade stream status (at least 1 connected = streaming)
-            trade_connected = message.data.get("trade_streams_connected", 0) > 0
-            selected_area.trade_stream_pane.set_streaming(trade_connected)
+            # TODO: Disabled rtds@position and rtds@trade panes - TUI state management needs redesign
+            # selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
+            # position_connected = message.data.get("position_stream_connected", False)
+            # selected_area.positions_pane.set_streaming(position_connected)
+            # trade_connected = message.data.get("trade_streams_connected", 0) > 0
+            # selected_area.trade_stream_pane.set_streaming(trade_connected)
         except Exception as e:
             logger.debug(f"Error handling stream status update: {e}")
 
@@ -895,7 +896,7 @@ class Aequify(App):
     def on_trading_apex_live_update(self, message: TradingApexLiveUpdate) -> None:
         """Handle APEX live metrics update from PubSub."""
         try:
-            from aequify.tui.widgets.symbols.apex_chart_pane import APEXTUIState, OptimizedParams
+            from aequify.tui.widgets.symbols.apex_chart_pane import APEXTUIState, OptimizedParams  # noqa: F401
 
             selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
             apex_pane = selected_area.apex_chart_pane
