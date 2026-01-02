@@ -476,38 +476,38 @@ class APEXConfig:
         long_data = bootstrap_data.get("long", {})
         long_price_move_bounds = parse_bounds(
             long_data.get("price_move_pct", {}),
-            ParameterBounds(min=-3.0, max=-0.5, default=-2.0, step=0.5),
+            ParameterBounds(min=-7.75, max=-1.75, default=-3.5, step=1.0),
         )
         long_delta_threshold_bounds = parse_bounds(
-            long_data.get("volume_delta_threshold", {}),
-            ParameterBounds(min=-70, max=-30, default=-50, step=10),
+            long_data.get("volume_imbalance_threshold", {}),
+            ParameterBounds(min=-90, max=-70, default=-50, step=10),
         )
 
         # SHORT bounds from bootstrap.short
         short_data = bootstrap_data.get("short", {})
         short_price_move_bounds = parse_bounds(
             short_data.get("price_move_pct", {}),
-            ParameterBounds(min=0.5, max=3.0, default=2.0, step=0.5),
+            ParameterBounds(min=5.0, max=20.0, default=7.0, step=5.0),
         )
         short_delta_threshold_bounds = parse_bounds(
-            short_data.get("volume_delta_threshold", {}),
-            ParameterBounds(min=30, max=70, default=50, step=10),
+            short_data.get("volume_imbalance_threshold", {}),
+            ParameterBounds(min=70, max=90, default=50, step=10),
         )
 
         # DCA distance bounds
         long_dca_distance_bounds = parse_bounds(
             long_data.get("dca_distance_pct", {}),
-            ParameterBounds(min=-40.0, max=-2.0, default=-5.0, step=2.0),
+            ParameterBounds(min=-9.75, max=-3.75, default=-3.5, step=2.0),
         )
         short_dca_distance_bounds = parse_bounds(
             short_data.get("dca_distance_pct", {}),
-            ParameterBounds(min=2.0, max=40.0, default=5.0, step=2.0),
+            ParameterBounds(min=10.0, max=40.0, default=7.0, step=10.0),
         )
 
         # Position bounds (TP/SL/MaxHold) - fallback values when no session levels
         target_profit_bounds = parse_bounds(
             tp_data,
-            ParameterBounds(min=0.5, max=2.0, default=1.0, step=0.5),
+            ParameterBounds(min=1.75, max=5.75, default=1.5, step=2.0),
         )
 
         stop_loss_bounds = parse_bounds(
@@ -516,18 +516,19 @@ class APEXConfig:
         )
         max_hold_time_bounds = parse_bounds(
             mh_bounds_data,
-            ParameterBounds(min=900000, max=3600000, default=1800000, step=900000),
+            ParameterBounds(min=900000, max=14400000, default=900000, step=3600000),
         )
 
-        # Time windows in milliseconds from bootstrap.lookback_windows_ms
-        time_windows_ms = bootstrap_data.get(
-            "lookback_windows_ms", [300, 500, 1000, 2000, 3000]
+        # Time windows in milliseconds from bootstrap.rolling_kernel.lookback_windows_ms
+        rolling_kernel_data = bootstrap_data.get("rolling_kernel", {})
+        time_windows_ms = rolling_kernel_data.get(
+            "lookback_windows_ms", [900000, 14400000]
         )
 
         # Volume imbalance price tolerance from bootstrap.volume_imbalance_kernel
         volume_imbalance_data = bootstrap_data.get("volume_imbalance_kernel", {})
         imbalance_price_tolerance_pct = volume_imbalance_data.get(
-            "price_tolerance_pct", 1.0
+            "price_tolerance_pct", 2.5
         )
 
         # Bootstrap config
@@ -547,8 +548,8 @@ class APEXConfig:
             short_delta_threshold_bounds=short_delta_threshold_bounds,
             long_dca_distance_bounds=long_dca_distance_bounds,
             short_dca_distance_bounds=short_dca_distance_bounds,
-            long_signal_offset=long_data.get("signal_offset", 0.0),
-            short_signal_offset=short_data.get("signal_offset", 0.0),
+            long_signal_offset=long_data.get("signal_offset", 0.25),
+            short_signal_offset=short_data.get("signal_offset", 0.25),
             target_profit_bounds=target_profit_bounds,
             stop_loss_bounds=stop_loss_bounds,
             max_hold_time_bounds=max_hold_time_bounds,

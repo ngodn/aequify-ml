@@ -13,6 +13,7 @@ Architecture-adaptive constants for NVIDIA/AMD/Apple GPUs.
 
 from math import ceildiv, log2
 from sys import has_accelerator
+from time import perf_counter_ns
 
 from gpu import thread_idx, block_idx, block_dim, global_idx, barrier
 from gpu.host import DeviceContext
@@ -685,17 +686,15 @@ fn bootstrap_internal(
     Full GPU-accelerated bootstrap pipeline.
 
     ALL computation runs on GPU. Only data transfer uses CPU.
+    GIL is released during GPU operations to allow other Python threads to run.
     """
     var py = Python()
     var np = Python.import_module("numpy")
-    var time_module = Python.import_module("time")
 
     var n = Int(timestamps.shape[0])
     var n_windows = Int(len(time_windows_ms))
     var n_long = Int(long_param_grid.shape[0])
     var n_short = Int(short_param_grid.shape[0])
-
-    var total_start = time_module.perf_counter()
 
     # Ensure arrays are contiguous and correct dtype
     var ts_arr = np.ascontiguousarray(timestamps, dtype=np.int64)
@@ -705,26 +704,66 @@ fn bootstrap_internal(
     var long_params = np.ascontiguousarray(long_param_grid.flatten(), dtype=np.float64)
     var short_params = np.ascontiguousarray(short_param_grid.flatten(), dtype=np.float64)
 
+    # =========================================================================
+    # EXTRACT ALL NUMPY POINTERS BEFORE RELEASING GIL
+    # =========================================================================
+    var ts_addr = Int(ts_arr.ctypes.data)
+    var px_addr = Int(px_arr.ctypes.data)
+    var qty_addr = Int(qty_arr.ctypes.data)
+    var sd_addr = Int(sd_arr.ctypes.data)
+    var long_params_addr = Int(long_params.ctypes.data)
+    var short_params_addr = Int(short_params.ctypes.data)
+
+    # Extract time windows to Mojo list (no Python access needed later)
+    var windows = List[Int64]()
+    for w_idx in range(n_windows):
+        windows.append(Int64(Int(time_windows_ms[w_idx])))
+
+    # Pre-allocate output numpy arrays (need GIL for this)
+    var long_entries = np.zeros(n_long, dtype=np.int32)
+    var long_winners = np.zeros(n_long, dtype=np.int32)
+    var long_pnls = np.zeros(n_long, dtype=np.float64)
+    var short_entries = np.zeros(n_short, dtype=np.int32)
+    var short_winners = np.zeros(n_short, dtype=np.int32)
+    var short_pnls = np.zeros(n_short, dtype=np.float64)
+
+    # Extract output array addresses
+    var long_entries_addr = Int(long_entries.ctypes.data)
+    var long_winners_addr = Int(long_winners.ctypes.data)
+    var long_pnls_addr = Int(long_pnls.ctypes.data)
+    var short_entries_addr = Int(short_entries.ctypes.data)
+    var short_winners_addr = Int(short_winners.ctypes.data)
+    var short_pnls_addr = Int(short_pnls.ctypes.data)
+
+    # =========================================================================
+    # GPU COMPUTATION - ALL IN SINGLE GIL-RELEASED BLOCK
+    # =========================================================================
+    var total_start_ns = perf_counter_ns()
+    var long_time_ns: Int = 0
+    var short_time_ns: Int = 0
+
     var ctx = DeviceContext()
 
-    # STEP 1: Copy input data to GPU
+    # Create host buffers (outside GIL block - may need Python internally)
     var ts_host = ctx.enqueue_create_host_buffer[DType.int64](n)
     var px_host = ctx.enqueue_create_host_buffer[DType.float64](n)
     var qty_host = ctx.enqueue_create_host_buffer[DType.float64](n)
     var sd_host = ctx.enqueue_create_host_buffer[DType.int32](n)
 
-    var ts_addr = Int(ts_arr.ctypes.data)
-    var px_addr = Int(px_arr.ctypes.data)
-    var qty_addr = Int(qty_arr.ctypes.data)
-    var sd_addr = Int(sd_arr.ctypes.data)
+    # Create param host buffers
+    var long_params_host = ctx.enqueue_create_host_buffer[DType.float64](n_long * 9)
+    var short_params_host = ctx.enqueue_create_host_buffer[DType.float64](n_short * 9)
 
-    var windows = List[Int64]()
-    for w_idx in range(n_windows):
-        windows.append(Int64(Int(time_windows_ms[w_idx])))
-
+    # =========================================================================
+    # SINGLE GIL-RELEASED BLOCK FOR ALL GPU OPERATIONS
+    # This allows other Python threads to run while GPU computes
+    # =========================================================================
     with GILReleased(py):
         ctx.synchronize()
 
+        # ---------------------------------------------------------------------
+        # STEP 1: Copy input data from numpy to pinned host memory
+        # ---------------------------------------------------------------------
         memcpy(
             dest=ts_host.unsafe_ptr().bitcast[UInt8](),
             src=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=ts_addr),
@@ -745,70 +784,6 @@ fn bootstrap_internal(
             src=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=sd_addr),
             count=n * 4,
         )
-
-    var ts_dev = ctx.enqueue_create_buffer[DType.int64](n)
-    var px_dev = ctx.enqueue_create_buffer[DType.float64](n)
-    var qty_dev = ctx.enqueue_create_buffer[DType.float64](n)
-    var sd_dev = ctx.enqueue_create_buffer[DType.int32](n)
-    ctx.enqueue_copy(dst_buf=ts_dev, src_buf=ts_host)
-    ctx.enqueue_copy(dst_buf=px_dev, src_buf=px_host)
-    ctx.enqueue_copy(dst_buf=qty_dev, src_buf=qty_host)
-    ctx.enqueue_copy(dst_buf=sd_dev, src_buf=sd_host)
-
-    # STEP 2: Compute volume imbalance on GPU
-    var imbalance_dev = ctx.enqueue_create_buffer[DType.float64](n)
-    var imbalance_blocks = ceildiv(n, BLOCK_SIZE)
-
-    ctx.enqueue_function_checked[volume_imbalance_kernel, volume_imbalance_kernel](
-        ts_dev.unsafe_ptr(),
-        px_dev.unsafe_ptr(),
-        qty_dev.unsafe_ptr(),
-        sd_dev.unsafe_ptr(),
-        imbalance_dev.unsafe_ptr(),
-        imbalance_price_tolerance_pct,
-        Int32(n),
-        grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
-    )
-
-    # STEP 3: Compute rolling highs/lows on GPU
-    var rolling_size = n_windows * n
-    var rh_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
-    var rl_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
-
-    for w_idx in range(n_windows):
-        var window_ms = windows[w_idx]
-        var offset = w_idx * n
-
-        ctx.enqueue_function_checked[rolling_high_kernel, rolling_high_kernel](
-            ts_dev.unsafe_ptr(),
-            px_dev.unsafe_ptr(),
-            rh_dev.unsafe_ptr().offset(offset),
-            window_ms,
-            Int32(n),
-            grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
-        )
-
-        ctx.enqueue_function_checked[rolling_low_kernel, rolling_low_kernel](
-            ts_dev.unsafe_ptr(),
-            px_dev.unsafe_ptr(),
-            rl_dev.unsafe_ptr().offset(offset),
-            window_ms,
-            Int32(n),
-            grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
-        )
-
-    with GILReleased(py):
-        ctx.synchronize()
-
-    # STEP 4: Upload param grids to GPU
-    var long_params_addr = Int(long_params.ctypes.data)
-    var short_params_addr = Int(short_params.ctypes.data)
-
-    var long_params_host = ctx.enqueue_create_host_buffer[DType.float64](n_long * 9)
-    var short_params_host = ctx.enqueue_create_host_buffer[DType.float64](n_short * 9)
-    with GILReleased(py):
-        ctx.synchronize()
-
         memcpy(
             dest=long_params_host.unsafe_ptr().bitcast[UInt8](),
             src=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=long_params_addr),
@@ -820,55 +795,107 @@ fn bootstrap_internal(
             count=n_short * 9 * 8,
         )
 
-    var long_params_dev = ctx.enqueue_create_buffer[DType.float64](n_long * 9)
-    var short_params_dev = ctx.enqueue_create_buffer[DType.float64](n_short * 9)
-    ctx.enqueue_copy(dst_buf=long_params_dev, src_buf=long_params_host)
-    ctx.enqueue_copy(dst_buf=short_params_dev, src_buf=short_params_host)
+        # ---------------------------------------------------------------------
+        # STEP 2: Transfer to GPU device memory
+        # ---------------------------------------------------------------------
+        var ts_dev = ctx.enqueue_create_buffer[DType.int64](n)
+        var px_dev = ctx.enqueue_create_buffer[DType.float64](n)
+        var qty_dev = ctx.enqueue_create_buffer[DType.float64](n)
+        var sd_dev = ctx.enqueue_create_buffer[DType.int32](n)
+        ctx.enqueue_copy(dst_buf=ts_dev, src_buf=ts_host)
+        ctx.enqueue_copy(dst_buf=px_dev, src_buf=px_host)
+        ctx.enqueue_copy(dst_buf=qty_dev, src_buf=qty_host)
+        ctx.enqueue_copy(dst_buf=sd_dev, src_buf=sd_host)
 
-    # STEP 5: Run LONG grid search on GPU
-    var long_start = time_module.perf_counter()
+        var long_params_dev = ctx.enqueue_create_buffer[DType.float64](n_long * 9)
+        var short_params_dev = ctx.enqueue_create_buffer[DType.float64](n_short * 9)
+        ctx.enqueue_copy(dst_buf=long_params_dev, src_buf=long_params_host)
+        ctx.enqueue_copy(dst_buf=short_params_dev, src_buf=short_params_host)
 
-    var long_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_long)
-    var long_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_long)
-    var long_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_long)
+        # ---------------------------------------------------------------------
+        # STEP 3: Compute volume imbalance on GPU
+        # ---------------------------------------------------------------------
+        var imbalance_dev = ctx.enqueue_create_buffer[DType.float64](n)
+        var imbalance_blocks = ceildiv(n, BLOCK_SIZE)
 
-    var long_blocks = ceildiv(n_long, WARPS_PER_BLOCK)
-    ctx.enqueue_function_checked[grid_search_long_kernel, grid_search_long_kernel](
-        ts_dev.unsafe_ptr(),
-        px_dev.unsafe_ptr(),
-        imbalance_dev.unsafe_ptr(),
-        rh_dev.unsafe_ptr(),
-        long_params_dev.unsafe_ptr(),
-        long_entries_dev.unsafe_ptr(),
-        long_winners_dev.unsafe_ptr(),
-        long_pnl_dev.unsafe_ptr(),
-        Int32(n_long), Int32(n_windows), Int32(n), Int32(max_scan), Int32(outer_stride),
-        grid_dim=long_blocks, block_dim=BLOCK_SIZE
-    )
-    with GILReleased(py):
+        ctx.enqueue_function_checked[volume_imbalance_kernel, volume_imbalance_kernel](
+            ts_dev.unsafe_ptr(),
+            px_dev.unsafe_ptr(),
+            qty_dev.unsafe_ptr(),
+            sd_dev.unsafe_ptr(),
+            imbalance_dev.unsafe_ptr(),
+            imbalance_price_tolerance_pct,
+            Int32(n),
+            grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
+        )
+
+        # ---------------------------------------------------------------------
+        # STEP 4: Compute rolling highs/lows on GPU
+        # ---------------------------------------------------------------------
+        var rolling_size = n_windows * n
+        var rh_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
+        var rl_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
+
+        for w_idx in range(n_windows):
+            var window_ms = windows[w_idx]
+            var offset = w_idx * n
+
+            ctx.enqueue_function_checked[rolling_high_kernel, rolling_high_kernel](
+                ts_dev.unsafe_ptr(),
+                px_dev.unsafe_ptr(),
+                rh_dev.unsafe_ptr().offset(offset),
+                window_ms,
+                Int32(n),
+                grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
+            )
+
+            ctx.enqueue_function_checked[rolling_low_kernel, rolling_low_kernel](
+                ts_dev.unsafe_ptr(),
+                px_dev.unsafe_ptr(),
+                rl_dev.unsafe_ptr().offset(offset),
+                window_ms,
+                Int32(n),
+                grid_dim=imbalance_blocks, block_dim=BLOCK_SIZE
+            )
+
         ctx.synchronize()
 
-    var long_time_ms = (time_module.perf_counter() - long_start) * 1000
+        # ---------------------------------------------------------------------
+        # STEP 5: Run LONG grid search on GPU
+        # ---------------------------------------------------------------------
+        var long_start_ns = perf_counter_ns()
 
-    # Copy LONG results back
-    var long_entries_host = ctx.enqueue_create_host_buffer[DType.int32](n_long)
-    var long_winners_host = ctx.enqueue_create_host_buffer[DType.int32](n_long)
-    var long_pnl_host = ctx.enqueue_create_host_buffer[DType.float64](n_long)
-    ctx.enqueue_copy(dst_buf=long_entries_host, src_buf=long_entries_dev)
-    ctx.enqueue_copy(dst_buf=long_winners_host, src_buf=long_winners_dev)
-    ctx.enqueue_copy(dst_buf=long_pnl_host, src_buf=long_pnl_dev)
-    with GILReleased(py):
+        var long_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_long)
+        var long_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_long)
+        var long_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_long)
+
+        var long_blocks = ceildiv(n_long, WARPS_PER_BLOCK)
+        ctx.enqueue_function_checked[grid_search_long_kernel, grid_search_long_kernel](
+            ts_dev.unsafe_ptr(),
+            px_dev.unsafe_ptr(),
+            imbalance_dev.unsafe_ptr(),
+            rh_dev.unsafe_ptr(),
+            long_params_dev.unsafe_ptr(),
+            long_entries_dev.unsafe_ptr(),
+            long_winners_dev.unsafe_ptr(),
+            long_pnl_dev.unsafe_ptr(),
+            Int32(n_long), Int32(n_windows), Int32(n), Int32(max_scan), Int32(outer_stride),
+            grid_dim=long_blocks, block_dim=BLOCK_SIZE
+        )
         ctx.synchronize()
 
-    var long_entries = np.zeros(n_long, dtype=np.int32)
-    var long_winners = np.zeros(n_long, dtype=np.int32)
-    var long_pnls = np.zeros(n_long, dtype=np.float64)
+        long_time_ns = Int(perf_counter_ns() - long_start_ns)
 
-    var long_entries_addr = Int(long_entries.ctypes.data)
-    var long_winners_addr = Int(long_winners.ctypes.data)
-    var long_pnls_addr = Int(long_pnls.ctypes.data)
+        # Copy LONG results back to host
+        var long_entries_host = ctx.enqueue_create_host_buffer[DType.int32](n_long)
+        var long_winners_host = ctx.enqueue_create_host_buffer[DType.int32](n_long)
+        var long_pnl_host = ctx.enqueue_create_host_buffer[DType.float64](n_long)
+        ctx.enqueue_copy(dst_buf=long_entries_host, src_buf=long_entries_dev)
+        ctx.enqueue_copy(dst_buf=long_winners_host, src_buf=long_winners_dev)
+        ctx.enqueue_copy(dst_buf=long_pnl_host, src_buf=long_pnl_dev)
+        ctx.synchronize()
 
-    with GILReleased(py):
+        # Copy to numpy arrays
         memcpy(
             dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=long_entries_addr),
             src=long_entries_host.unsafe_ptr().bitcast[UInt8](),
@@ -885,55 +912,42 @@ fn bootstrap_internal(
             count=n_long * 8,
         )
 
-    var long_result = select_best_params(
-        "LONG", long_param_grid, long_entries, long_winners, long_pnls,
-        min_entries, time_windows_ms
-    )
+        # ---------------------------------------------------------------------
+        # STEP 6: Run SHORT grid search on GPU
+        # ---------------------------------------------------------------------
+        var short_start_ns = perf_counter_ns()
 
-    # STEP 6: Run SHORT grid search on GPU
-    var short_start = time_module.perf_counter()
+        var short_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_short)
+        var short_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_short)
+        var short_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_short)
 
-    var short_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_short)
-    var short_winners_dev = ctx.enqueue_create_buffer[DType.int32](n_short)
-    var short_pnl_dev = ctx.enqueue_create_buffer[DType.float64](n_short)
-
-    var short_blocks = ceildiv(n_short, WARPS_PER_BLOCK)
-    ctx.enqueue_function_checked[grid_search_short_kernel, grid_search_short_kernel](
-        ts_dev.unsafe_ptr(),
-        px_dev.unsafe_ptr(),
-        imbalance_dev.unsafe_ptr(),
-        rl_dev.unsafe_ptr(),
-        short_params_dev.unsafe_ptr(),
-        short_entries_dev.unsafe_ptr(),
-        short_winners_dev.unsafe_ptr(),
-        short_pnl_dev.unsafe_ptr(),
-        Int32(n_short), Int32(n_windows), Int32(n), Int32(max_scan), Int32(outer_stride),
-        grid_dim=short_blocks, block_dim=BLOCK_SIZE
-    )
-    with GILReleased(py):
+        var short_blocks = ceildiv(n_short, WARPS_PER_BLOCK)
+        ctx.enqueue_function_checked[grid_search_short_kernel, grid_search_short_kernel](
+            ts_dev.unsafe_ptr(),
+            px_dev.unsafe_ptr(),
+            imbalance_dev.unsafe_ptr(),
+            rl_dev.unsafe_ptr(),
+            short_params_dev.unsafe_ptr(),
+            short_entries_dev.unsafe_ptr(),
+            short_winners_dev.unsafe_ptr(),
+            short_pnl_dev.unsafe_ptr(),
+            Int32(n_short), Int32(n_windows), Int32(n), Int32(max_scan), Int32(outer_stride),
+            grid_dim=short_blocks, block_dim=BLOCK_SIZE
+        )
         ctx.synchronize()
 
-    var short_time_ms = (time_module.perf_counter() - short_start) * 1000
+        short_time_ns = Int(perf_counter_ns() - short_start_ns)
 
-    # Copy SHORT results back
-    var short_entries_host = ctx.enqueue_create_host_buffer[DType.int32](n_short)
-    var short_winners_host = ctx.enqueue_create_host_buffer[DType.int32](n_short)
-    var short_pnl_host = ctx.enqueue_create_host_buffer[DType.float64](n_short)
-    ctx.enqueue_copy(dst_buf=short_entries_host, src_buf=short_entries_dev)
-    ctx.enqueue_copy(dst_buf=short_winners_host, src_buf=short_winners_dev)
-    ctx.enqueue_copy(dst_buf=short_pnl_host, src_buf=short_pnl_dev)
-    with GILReleased(py):
+        # Copy SHORT results back to host
+        var short_entries_host = ctx.enqueue_create_host_buffer[DType.int32](n_short)
+        var short_winners_host = ctx.enqueue_create_host_buffer[DType.int32](n_short)
+        var short_pnl_host = ctx.enqueue_create_host_buffer[DType.float64](n_short)
+        ctx.enqueue_copy(dst_buf=short_entries_host, src_buf=short_entries_dev)
+        ctx.enqueue_copy(dst_buf=short_winners_host, src_buf=short_winners_dev)
+        ctx.enqueue_copy(dst_buf=short_pnl_host, src_buf=short_pnl_dev)
         ctx.synchronize()
 
-    var short_entries = np.zeros(n_short, dtype=np.int32)
-    var short_winners = np.zeros(n_short, dtype=np.int32)
-    var short_pnls = np.zeros(n_short, dtype=np.float64)
-
-    var short_entries_addr = Int(short_entries.ctypes.data)
-    var short_winners_addr = Int(short_winners.ctypes.data)
-    var short_pnls_addr = Int(short_pnls.ctypes.data)
-
-    with GILReleased(py):
+        # Copy to numpy arrays
         memcpy(
             dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=short_entries_addr),
             src=short_entries_host.unsafe_ptr().bitcast[UInt8](),
@@ -950,47 +964,66 @@ fn bootstrap_internal(
             count=n_short * 8,
         )
 
+        # ---------------------------------------------------------------------
+        # STEP 7: Free GPU memory
+        # ---------------------------------------------------------------------
+        _ = ts_dev^
+        _ = px_dev^
+        _ = qty_dev^
+        _ = sd_dev^
+        _ = imbalance_dev^
+        _ = rh_dev^
+        _ = rl_dev^
+        _ = long_params_dev^
+        _ = short_params_dev^
+        _ = long_entries_dev^
+        _ = long_winners_dev^
+        _ = long_pnl_dev^
+        _ = short_entries_dev^
+        _ = short_winners_dev^
+        _ = short_pnl_dev^
+
+        _ = ts_host^
+        _ = px_host^
+        _ = qty_host^
+        _ = sd_host^
+        _ = long_params_host^
+        _ = short_params_host^
+        _ = long_entries_host^
+        _ = long_winners_host^
+        _ = long_pnl_host^
+        _ = short_entries_host^
+        _ = short_winners_host^
+        _ = short_pnl_host^
+
+        ctx.synchronize()
+
+    # END OF GIL-RELEASED BLOCK
+    # =========================================================================
+
+    var total_time_ns = perf_counter_ns() - total_start_ns
+
+    # Convert timing from nanoseconds to milliseconds
+    var total_time_ms = Float64(total_time_ns) / 1_000_000.0
+    var long_time_ms = Float64(long_time_ns) / 1_000_000.0
+    var short_time_ms = Float64(short_time_ns) / 1_000_000.0
+
+    # =========================================================================
+    # STEP 8: Select best params (needs GIL for Python object access)
+    # =========================================================================
+    var long_result = select_best_params(
+        "LONG", long_param_grid, long_entries, long_winners, long_pnls,
+        min_entries, time_windows_ms
+    )
+
     var short_result = select_best_params(
         "SHORT", short_param_grid, short_entries, short_winners, short_pnls,
         min_entries, time_windows_ms
     )
 
-    var total_time_ms = (time_module.perf_counter() - total_start) * 1000
-
-    # STEP 7: Free GPU memory
-    _ = ts_dev^
-    _ = px_dev^
-    _ = qty_dev^
-    _ = sd_dev^
-    _ = imbalance_dev^
-    _ = rh_dev^
-    _ = rl_dev^
-    _ = long_params_dev^
-    _ = short_params_dev^
-    _ = long_entries_dev^
-    _ = long_winners_dev^
-    _ = long_pnl_dev^
-    _ = short_entries_dev^
-    _ = short_winners_dev^
-    _ = short_pnl_dev^
-
-    _ = ts_host^
-    _ = px_host^
-    _ = qty_host^
-    _ = sd_host^
-    _ = long_params_host^
-    _ = short_params_host^
-    _ = long_entries_host^
-    _ = long_winners_host^
-    _ = long_pnl_host^
-    _ = short_entries_host^
-    _ = short_winners_host^
-    _ = short_pnl_host^
-
-    with GILReleased(py):
-        ctx.synchronize()
-
-    # STEP 8: Build result dict
+    # =========================================================================
+    # STEP 9: Build result dict (needs GIL for Python object creation)
+    # =========================================================================
     var builtins = Python.import_module("builtins")
 
     var arch_dict = builtins.dict()
@@ -1014,9 +1047,9 @@ fn bootstrap_internal(
     result[PythonObject("short_entries")] = short_entries
     result[PythonObject("short_winners")] = short_winners
     result[PythonObject("short_pnls")] = short_pnls
-    result[PythonObject("gpu_time_ms")] = total_time_ms
-    result[PythonObject("long_time_ms")] = long_time_ms
-    result[PythonObject("short_time_ms")] = short_time_ms
+    result[PythonObject("gpu_time_ms")] = PythonObject(total_time_ms)
+    result[PythonObject("long_time_ms")] = PythonObject(long_time_ms)
+    result[PythonObject("short_time_ms")] = PythonObject(short_time_ms)
     result[PythonObject("n_trades")] = PythonObject(n)
     result[PythonObject("n_long_combos")] = PythonObject(n_long)
     result[PythonObject("n_short_combos")] = PythonObject(n_short)
@@ -1036,10 +1069,9 @@ fn bootstrap_py(params: PythonObject) raises -> PythonObject:
     Python binding for bootstrap (takes dict as argument).
 
     Args:
-        params: A dict containing:
-            timestamps, prices, quantities, sides,
-            time_windows_ms, long_param_grid, short_param_grid,
-            imbalance_price_tolerance_pct, max_scan, outer_stride, min_entries
+        params: A dict containing `timestamps`, `prices`, `quantities`, `sides`,
+            `time_windows_ms`, `long_param_grid`, `short_param_grid`,
+            `imbalance_price_tolerance_pct`, `max_scan`, `outer_stride`, `min_entries`.
     """
     return bootstrap_internal(
         params[PythonObject("timestamps")],
