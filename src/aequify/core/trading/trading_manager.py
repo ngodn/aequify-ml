@@ -383,12 +383,15 @@ class TradingManager:
         self._init_symbol_registry()
         self._sync_trade_streams()
 
-        # Start isolated loop
+        # Start isolated loop (for non-CCXT operations like backfill/bootstrap)
         self._loop.start()
 
-        # Start background tasks in the isolated loop
+        # Start background tasks on the CURRENT loop (engine's loop)
+        # IMPORTANT: These tasks call CCXT methods which are tied to the loop
+        # where the client was initialized. Running them on a different loop
+        # causes "Timeout context manager should be used inside a task" errors.
         self._running = True
-        self._loop.schedule(self._start_background_tasks())
+        await self._start_background_tasks()
 
         logger.info(
             f"TradingManager initialized "
@@ -406,20 +409,29 @@ class TradingManager:
 
     async def _start_background_tasks(self) -> None:
         """Start all background monitoring tasks in the isolated loop."""
-        loop = asyncio.get_event_loop()
+        # Use asyncio.create_task() which is the modern idiom in Python 3.7+
+        # This properly handles task context in Python 3.10+
 
         # Exit monitoring loop
-        self._exit_monitor_task = loop.create_task(self._exit_monitor_loop())
+        self._exit_monitor_task = asyncio.create_task(
+            self._exit_monitor_loop(), name="exit-monitor"
+        )
 
         # Filter update loop (if filter pipeline is configured)
         if self._filter_pipeline:
-            self._filter_update_task = loop.create_task(self._filter_update_loop())
+            self._filter_update_task = asyncio.create_task(
+                self._filter_update_loop(), name="filter-update"
+            )
 
         # Position reconciliation loop
-        self._reconciliation_task = loop.create_task(self._position_reconciliation_loop())
+        self._reconciliation_task = asyncio.create_task(
+            self._position_reconciliation_loop(), name="position-reconciliation"
+        )
 
         # Live metrics publishing loop (for APEX TUI)
-        self._live_metrics_task = loop.create_task(self._live_metrics_loop())
+        self._live_metrics_task = asyncio.create_task(
+            self._live_metrics_loop(), name="live-metrics"
+        )
 
         logger.debug("Background tasks started")
 

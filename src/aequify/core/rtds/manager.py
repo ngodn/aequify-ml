@@ -264,8 +264,6 @@ class StreamManager:
 
     async def _consume_trades(self) -> None:
         """Consume trades from queue and call callback."""
-        loop = asyncio.get_event_loop()
-
         while self._running:
             try:
                 # Non-blocking check for trades

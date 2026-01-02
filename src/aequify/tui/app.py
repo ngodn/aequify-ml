@@ -577,7 +577,7 @@ class Aequify(App):
                         try:
                             update_engine_status("connecting")
                             # Run blocking connect in thread pool to avoid blocking UI
-                            await asyncio.get_event_loop().run_in_executor(
+                            await asyncio.get_running_loop().run_in_executor(
                                 self._executor, self._subscriber.connect
                             )
                             logger.info("PubSub connected!")
@@ -590,7 +590,7 @@ class Aequify(App):
 
                     # Check for messages (non-blocking with short timeout)
                     # Run in executor to avoid blocking UI
-                    msg = await asyncio.get_event_loop().run_in_executor(
+                    msg = await asyncio.get_running_loop().run_in_executor(
                         self._executor, lambda: self._subscriber.receive(timeout=0.1)
                     )
                     if msg:
