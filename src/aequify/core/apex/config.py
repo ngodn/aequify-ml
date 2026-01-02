@@ -140,13 +140,19 @@ class BootstrapConfig:
     """Configuration for bootstrap optimization."""
 
     max_trades: int = 0  # 0 = use all available trades, or limit to N trades
+    trades_lookback_days: int = 90  # Number of days of historical trades to backfill
+    min_lookback_days: int = 7  # Minimum days required for valid bootstrap
 
     @classmethod
     def from_dict(cls, data: dict) -> BootstrapConfig:
         """Create from dictionary."""
         if not data:
             return cls()
-        return cls(max_trades=data.get("max_trades", 0))
+        return cls(
+            max_trades=data.get("max_trades", 0),
+            trades_lookback_days=int(data.get("trades_lookback_days", 90)),
+            min_lookback_days=int(data.get("min_lookback_days", 7)),
+        )
 
 
 @dataclass

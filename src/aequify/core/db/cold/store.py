@@ -334,6 +334,26 @@ class ColdStore:
         row = await self._client.query_one(sql, symbol)
         return int(row["count"]) if row else 0
 
+    async def get_timestamp_range(self, symbol: str) -> tuple[int, int] | None:
+        """
+        Get the min and max timestamps for a symbol's trades.
+
+        Args:
+            symbol: Trading pair.
+
+        Returns:
+            Tuple of (min_timestamp_ms, max_timestamp_ms) or None if no trades.
+        """
+        sql = f"""
+            SELECT MIN(timestamp_ms) as min_ts, MAX(timestamp_ms) as max_ts
+            FROM {self.TABLE_TRADES}
+            WHERE symbol = $1
+        """
+        row = await self._client.query_one(sql, symbol)
+        if row and row.get("min_ts") is not None and row.get("max_ts") is not None:
+            return (int(row["min_ts"]), int(row["max_ts"]))
+        return None
+
     async def trade_exists(self, symbol: str, trade_id: int) -> bool:
         """
         Check if a trade already exists.
@@ -828,6 +848,11 @@ class SyncColdStore:
         """Get trade count for a symbol."""
         store = self._ensure_running()
         return self._loop.run(store.get_trade_count(symbol), timeout=self._timeout)
+
+    def get_timestamp_range(self, symbol: str) -> tuple[int, int] | None:
+        """Get min/max timestamps for a symbol's trades."""
+        store = self._ensure_running()
+        return self._loop.run(store.get_timestamp_range(symbol), timeout=self._timeout)
 
     # =========================================================================
     # Bootstrap Results

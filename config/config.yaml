@@ -40,7 +40,7 @@ engines:
   apex:
     bootstrap:
       min_lookback_days: 7.0
-      trades_lookback_days: 30.0
+      trades_lookback_days: 90.0
       max_trades: 10000000
       max_cache_valid_days: 15.0
       rolling_kernel:

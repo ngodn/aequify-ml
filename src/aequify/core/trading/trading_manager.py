@@ -1640,11 +1640,7 @@ class TradingManager:
                     from aequify.core.db.cold.backfill import BackfillManager
 
                     backfill_config = BackfillConfig(
-                        lookback_days=int(
-                            config.bootstrap.max_trades / 100000
-                            if config.bootstrap.max_trades > 0
-                            else 90
-                        ),
+                        lookback_days=config.bootstrap.trades_lookback_days,
                         skip_existing=not force_backfill,
                     )
 
@@ -1675,7 +1671,32 @@ class TradingManager:
                         f"[{symbol}] Backfill complete: {backfill_result.total_trades if backfill_result else 0:,} trades"
                     )
 
-                    # 3. Load trades from cold store as numpy arrays
+                    # 3. Validate min_lookback_days
+                    min_lookback_days = config.bootstrap.min_lookback_days
+                    if min_lookback_days > 0:
+                        ts_range = await store.get_timestamp_range(symbol)
+                        if ts_range is None:
+                            logger.warning(
+                                f"[{symbol}] No trades in cold store, cannot validate min_lookback_days"
+                            )
+                            return None
+
+                        min_ts, max_ts = ts_range
+                        MS_PER_DAY = 1000 * 60 * 60 * 24
+                        available_days = (max_ts - min_ts) / MS_PER_DAY
+
+                        if available_days < min_lookback_days:
+                            logger.warning(
+                                f"[{symbol}] Insufficient data for bootstrap: "
+                                f"{available_days:.1f} days < {min_lookback_days} days required"
+                            )
+                            return None
+
+                        logger.info(
+                            f"[{symbol}] Data range validated: {available_days:.1f} days available"
+                        )
+
+                    # 4. Load trades from cold store as numpy arrays
                     trades = await store.get_trades(
                         symbol, limit=config.bootstrap.max_trades or 500000
                     )
@@ -1695,7 +1716,7 @@ class TradingManager:
 
                     logger.info(f"[{symbol}] Loaded {len(trades):,} trades for bootstrap")
 
-                    # 4. Run bootstrap
+                    # 5. Run bootstrap
                     logger.info(f"[{symbol}] Starting bootstrap...")
                     bootstrap_result = await bootstrap_symbol(
                         symbol=symbol,
@@ -1706,7 +1727,7 @@ class TradingManager:
                         config=config,
                     )
 
-                    # 5. Save both directions to cold store
+                    # 6. Save both directions to cold store
                     if bootstrap_result.long:
                         await store.insert_bootstrap_result(
                             bootstrap_result.long.to_cold_store(symbol)
@@ -1717,7 +1738,7 @@ class TradingManager:
                         )
                     logger.info(f"[{symbol}] Bootstrap saved to cold store")
 
-                    # 6. Store in memory and publish to TUI
+                    # 7. Store in memory and publish to TUI
                     self._bootstrapped_symbols[symbol] = bootstrap_result
                     self._publish_apex_state(symbol, bootstrap_result, source="bootstrap")
                     self._create_live_detector(symbol, bootstrap_result)
