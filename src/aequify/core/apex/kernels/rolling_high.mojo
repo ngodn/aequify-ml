@@ -234,7 +234,7 @@ fn _rolling_high_gpu_kernel(
 
     Each thread processes one element.
     Uses binary search for O(log n) window boundary finding.
-    Uses SIMD vec2 loads for finding maximum.
+    Uses scalar loads to avoid alignment/SIMD issues on GPU.
     """
     var i = Int(global_idx.x)
 
@@ -259,26 +259,13 @@ fn _rolling_high_gpu_kernel(
         result[i] = 0.0
         return
 
-    # Find max with SIMD vectorized loads
+    # Find max using scalar loads (GPU threads are already SIMT-parallel)
     var max_val = prices[start_idx]
-    var window_size = i - start_idx - 1
 
-    var j = start_idx + 1
-    var end_aligned = start_idx + 1 + (window_size // GPU_SIMD_WIDTH_F64) * GPU_SIMD_WIDTH_F64
-
-    # SIMD vec2 loads with reduce_max
-    while j < end_aligned:
-        var vec = prices.load[width=GPU_SIMD_WIDTH_F64](j)
-        var local_max = vec.reduce_max()
-        if local_max > max_val:
-            max_val = local_max
-        j += GPU_SIMD_WIDTH_F64
-
-    # Handle remaining elements (scalar)
-    while j < i:
-        if prices[j] > max_val:
-            max_val = prices[j]
-        j += 1
+    for j in range(start_idx + 1, i):
+        var p = prices[j]
+        if p > max_val:
+            max_val = p
 
     result[i] = max_val
 

@@ -237,7 +237,7 @@ fn _rolling_low_gpu_kernel(
 
     Each thread processes one element.
     Uses binary search for O(log n) window boundary finding.
-    Uses SIMD vec2 loads for finding minimum.
+    Uses scalar loads to avoid alignment/SIMD issues on GPU.
     """
     var i = Int(global_idx.x)
 
@@ -262,26 +262,13 @@ fn _rolling_low_gpu_kernel(
         result[i] = NO_LOW_SENTINEL
         return
 
-    # Find min with SIMD vectorized loads
+    # Find min using scalar loads (GPU threads are already SIMT-parallel)
     var min_val = prices[start_idx]
-    var window_size = i - start_idx - 1
 
-    var j = start_idx + 1
-    var end_aligned = start_idx + 1 + (window_size // GPU_SIMD_WIDTH_F64) * GPU_SIMD_WIDTH_F64
-
-    # SIMD vec2 loads with reduce_min
-    while j < end_aligned:
-        var vec = prices.load[width=GPU_SIMD_WIDTH_F64](j)
-        var local_min = vec.reduce_min()
-        if local_min < min_val:
-            min_val = local_min
-        j += GPU_SIMD_WIDTH_F64
-
-    # Handle remaining elements (scalar)
-    while j < i:
-        if prices[j] < min_val:
-            min_val = prices[j]
-        j += 1
+    for j in range(start_idx + 1, i):
+        var p = prices[j]
+        if p < min_val:
+            min_val = p
 
     result[i] = min_val
 

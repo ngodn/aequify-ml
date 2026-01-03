@@ -131,22 +131,24 @@ fn compute_memory_per_trade(num_buckets: Int) -> Int:
     return base_bytes + prefix_bytes
 
 
-fn compute_num_buckets(tolerance_pct: Float64) -> Int:
-    """Compute optimal number of buckets based on tolerance.
+fn compute_num_buckets(tolerance_pct: Float64, price_range_pct: Float64 = 10.0) -> Int:
+    """Compute optimal number of buckets based on tolerance and actual price range.
 
     Rule of thumb: bucket_size = tolerance / 5 for good granularity.
-    For 100% price range coverage.
+    Uses actual price range instead of fixed 100% to save memory.
 
     Args:
         tolerance_pct: Price tolerance percentage (e.g., 2.5 for 2.5%).
+        price_range_pct: Actual price range in dataset as percentage (default 10%).
 
     Returns:
         Number of buckets.
     """
     var bucket_size_pct = tolerance_pct / 5.0
-    var num_buckets = Int(ceil(100.0 / bucket_size_pct))
-    # Clamp between reasonable bounds
-    return max(50, min(500, num_buckets))
+    # Use actual price range, not 100% - this was causing 200 buckets instead of ~20
+    var num_buckets = Int(ceil(price_range_pct / bucket_size_pct))
+    # Clamp between reasonable bounds (reduced max from 500 to 100)
+    return max(10, min(100, num_buckets))
 
 
 fn get_max_trades_for_vram(tolerance_pct: Float64 = 2.5, safety_margin: Float64 = 0.85) raises -> Int:
@@ -513,8 +515,18 @@ fn volume_imbalance_gpu(
         tolerance_pct: Price tolerance percentage.
         n: Number of trades.
     """
-    var num_buckets = compute_num_buckets(tolerance_pct)
     var price_range = max_price - min_price
+    # Compute actual price range as percentage of mid price
+    var mid_price = (max_price + min_price) / 2.0
+    var price_range_pct: Float64
+    if mid_price > 0:
+        price_range_pct = (price_range / mid_price) * 100.0
+    else:
+        price_range_pct = 10.0
+    # Add some headroom (2x) to avoid edge effects, clamp to reasonable bounds
+    price_range_pct = max(5.0, min(50.0, price_range_pct * 2.0))
+
+    var num_buckets = compute_num_buckets(tolerance_pct, price_range_pct)
     var bucket_size = price_range / Float64(num_buckets)
 
     # Ensure bucket_size is positive
@@ -600,8 +612,17 @@ fn volume_imbalance_cpu[
 
     Uses the same algorithm as GPU but runs sequentially for validation.
     """
-    var num_buckets = compute_num_buckets(tolerance_pct)
     var price_range = max_price - min_price
+    # Compute actual price range as percentage of mid price
+    var mid_price = (max_price + min_price) / 2.0
+    var price_range_pct: Float64
+    if mid_price > 0:
+        price_range_pct = (price_range / mid_price) * 100.0
+    else:
+        price_range_pct = 10.0
+    price_range_pct = max(5.0, min(50.0, price_range_pct * 2.0))
+
+    var num_buckets = compute_num_buckets(tolerance_pct, price_range_pct)
     var bucket_size = price_range / Float64(num_buckets)
 
     if bucket_size <= 0:
