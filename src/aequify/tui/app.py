@@ -919,17 +919,32 @@ class Aequify(App):
             short_params = current_state.short_params
 
             # Update params if provided in metrics (for thresholds)
+            # Create params if they don't exist yet (live metrics arrived before bootstrap state)
             if metrics.get("long_params"):
                 lp = metrics["long_params"]
                 if long_params:
                     long_params.price_move = lp.get("price_move", long_params.price_move)
                     long_params.delta_threshold = lp.get("delta_threshold", long_params.delta_threshold)
+                else:
+                    # Create params from live metrics (bootstrap state not yet received)
+                    long_params = OptimizedParams(
+                        price_move=lp.get("price_move", -3.0),
+                        delta_threshold=lp.get("delta_threshold", -50.0),
+                        entries=0 if lp.get("is_default", True) else 1,  # Mark as default
+                    )
 
             if metrics.get("short_params"):
                 sp = metrics["short_params"]
                 if short_params:
                     short_params.price_move = sp.get("price_move", short_params.price_move)
                     short_params.delta_threshold = sp.get("delta_threshold", short_params.delta_threshold)
+                else:
+                    # Create params from live metrics (bootstrap state not yet received)
+                    short_params = OptimizedParams(
+                        price_move=sp.get("price_move", 3.0),
+                        delta_threshold=sp.get("delta_threshold", 50.0),
+                        entries=0 if sp.get("is_default", True) else 1,  # Mark as default
+                    )
 
             # Create updated state with live metrics
             updated_state = APEXTUIState(

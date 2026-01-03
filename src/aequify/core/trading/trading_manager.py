@@ -443,26 +443,46 @@ class TradingManager:
         from causing unexpected behavior.
         """
         try:
-            # Cancel all algo orders globally (TP/SL orders)
-            try:
-                await self.client.cancel_all_orders(params={"type": "algo"})
-                logger.info("Canceled all algo orders (TP/SL cleanup)")
-            except Exception as e:
-                # Some exchanges don't support global algo cancel
-                logger.debug(f"Global algo cancel not supported: {e}")
+            # Collect all symbols that need order cleanup
+            symbols_to_clean: set[str] = set()
 
-            # Get all positions and cancel orders per symbol
-            positions = await self.client.fetch_positions()
-            for pos in positions:
-                position_amt = float(pos.get("contracts", 0) or 0)
-                if position_amt != 0:
-                    symbol = pos.get("symbol", "")
-                    if symbol:
-                        try:
-                            await self.client.cancel_all_orders(symbol)
-                            logger.debug(f"Canceled orders for {symbol}")
-                        except Exception as e:
-                            logger.debug(f"Could not cancel orders for {symbol}: {e}")
+            # 1. Get symbols from open algo orders (TP/SL)
+            try:
+                algo_orders = await self.client.fetch_algo_open_orders(None)
+                for order in algo_orders:
+                    # Algo orders return Binance format symbol (e.g., "BTCUSDT")
+                    # Convert to CCXT format for cancel_all_orders
+                    binance_symbol = order.get("symbol", "")
+                    if binance_symbol:
+                        # Convert "BTCUSDT" -> "BTC/USDT:USDT"
+                        if binance_symbol.endswith("USDT"):
+                            base = binance_symbol[:-4]
+                            ccxt_symbol = f"{base}/USDT:USDT"
+                            symbols_to_clean.add(ccxt_symbol)
+                if algo_orders:
+                    logger.debug(f"Found {len(algo_orders)} algo orders to clean up")
+            except Exception as e:
+                logger.debug(f"Could not fetch algo orders: {e}")
+
+            # 2. Get symbols from open positions
+            try:
+                positions = await self.client.fetch_positions()
+                for pos in positions:
+                    position_amt = float(pos.get("contracts", 0) or 0)
+                    if position_amt != 0:
+                        symbol = pos.get("symbol", "")
+                        if symbol:
+                            symbols_to_clean.add(symbol)
+            except Exception as e:
+                logger.debug(f"Could not fetch positions: {e}")
+
+            # 3. Cancel all orders for each symbol
+            for symbol in symbols_to_clean:
+                try:
+                    await self.client.cancel_all_orders(symbol)
+                    logger.debug(f"Canceled orders for {symbol}")
+                except Exception as e:
+                    logger.debug(f"Could not cancel orders for {symbol}: {e}")
 
             logger.info("Startup order cleanup complete")
 
@@ -713,37 +733,78 @@ class TradingManager:
             }
 
             if result.long:
+                # is_default: True if no valid params found (entries=0, using defaults)
+                is_default = result.long.entries == 0
                 state["long_params"] = {
-                    "price_move": result.long.price_move,
-                    "time_window": result.long.time_window,
-                    "delta_threshold": result.long.delta_threshold,
-                    "dca_distance_pct": getattr(result.long, "dca_distance_pct", -3.0),
-                    "target_profit": result.long.target_profit,
-                    "stop_loss": result.long.stop_loss,
-                    "max_hold_time_ms": getattr(result.long, "max_hold_time_ms", 3600000),
+                    "price_move": result.long.params.price_move,
+                    "time_window": result.long.params.time_window,
+                    "delta_threshold": result.long.params.delta_threshold,
+                    "dca_distance_pct": getattr(result.long.params, "dca_distance_pct", -3.0),
+                    "target_profit": result.long.params.target_profit,
+                    "stop_loss": result.long.params.stop_loss,
+                    "max_hold_time_ms": result.long.params.max_hold_time,
                     "win_rate": result.long.win_rate,
                     "entries": result.long.entries,
                     "avg_pnl": result.long.avg_pnl,
+                    "is_default": is_default,
                 }
 
             if result.short:
+                is_default = result.short.entries == 0
                 state["short_params"] = {
-                    "price_move": result.short.price_move,
-                    "time_window": result.short.time_window,
-                    "delta_threshold": result.short.delta_threshold,
-                    "dca_distance_pct": getattr(result.short, "dca_distance_pct", 3.0),
-                    "target_profit": result.short.target_profit,
-                    "stop_loss": result.short.stop_loss,
-                    "max_hold_time_ms": getattr(result.short, "max_hold_time_ms", 3600000),
+                    "price_move": result.short.params.price_move,
+                    "time_window": result.short.params.time_window,
+                    "delta_threshold": result.short.params.delta_threshold,
+                    "dca_distance_pct": getattr(result.short.params, "dca_distance_pct", 3.0),
+                    "target_profit": result.short.params.target_profit,
+                    "stop_loss": result.short.params.stop_loss,
+                    "max_hold_time_ms": result.short.params.max_hold_time,
                     "win_rate": result.short.win_rate,
                     "entries": result.short.entries,
                     "avg_pnl": result.short.avg_pnl,
+                    "is_default": is_default,
                 }
 
             publisher.publish_apex_state(symbol, state)
             logger.debug(f"[{symbol}] Published APEX state to TUI (source={source})")
         except Exception as e:
             logger.debug(f"Failed to publish APEX state to PubSub: {e}")
+
+    def _generate_override_file(
+        self,
+        symbol: str,
+        result: "BootstrapResult",
+        trade_count: int = 0,
+        config: "APEXConfig | None" = None,
+    ) -> None:
+        """Generate override YAML file with narrowed bounds after bootstrap."""
+        import os
+        from aequify.core.apex.bootstrap import generate_override_for_symbol
+        from aequify.core.apex.config import load_apex_config_for_symbol
+
+        try:
+            # Load config if not provided
+            if config is None:
+                config = load_apex_config_for_symbol(self._config_path, symbol)
+
+            # Derive overrides directory from config path
+            config_dir = os.path.dirname(os.path.abspath(self._config_path))
+            overrides_dir = os.path.join(config_dir, "overrides")
+
+            # Generate override file with narrowed bounds
+            filepath = generate_override_for_symbol(
+                symbol=symbol,
+                config=config,
+                result=result,
+                overrides_dir=overrides_dir,
+                trade_count=trade_count,
+                overwrite=True,  # Always overwrite with fresh bootstrap results
+            )
+
+            if filepath:
+                logger.info(f"[{symbol}] Override file generated: {filepath}")
+        except Exception as e:
+            logger.warning(f"[{symbol}] Failed to generate override file: {e}")
 
     def _publish_backfill_progress(self, symbol: str, progress: "BackfillProgress") -> None:
         """Publish backfill progress to TUI via PubSub."""
@@ -1118,11 +1179,13 @@ class TradingManager:
                             metrics["long_params"] = {
                                 "price_move": bootstrap_result.long.params.price_move,
                                 "delta_threshold": bootstrap_result.long.params.delta_threshold,
+                                "is_default": bootstrap_result.long.entries == 0,
                             }
                         if bootstrap_result.short:
                             metrics["short_params"] = {
                                 "price_move": bootstrap_result.short.params.price_move,
                                 "delta_threshold": bootstrap_result.short.params.delta_threshold,
+                                "is_default": bootstrap_result.short.entries == 0,
                             }
 
                     # Add trade count
@@ -1737,6 +1800,9 @@ class TradingManager:
                             bootstrap_result.short.to_cold_store(symbol)
                         )
                     logger.info(f"[{symbol}] Bootstrap saved to cold store")
+
+                    # 6b. Generate override file (for persistence across restarts)
+                    self._generate_override_file(symbol, bootstrap_result, trade_count=len(timestamps))
 
                     # 7. Store in memory and publish to TUI
                     self._bootstrapped_symbols[symbol] = bootstrap_result
