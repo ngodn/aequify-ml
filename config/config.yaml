@@ -41,7 +41,7 @@ engines:
     bootstrap:
       min_lookback_days: 7.0
       trades_lookback_days: 90.0
-      max_trades: 25000000
+      max_trades: 8000000
       max_cache_valid_days: 15.0
       rolling_kernel:
         lookback_windows_ms:
