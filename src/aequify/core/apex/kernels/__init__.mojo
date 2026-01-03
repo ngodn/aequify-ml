@@ -1,53 +1,56 @@
-"""APEX Kernels - GPU-accelerated compute kernels for trading analytics."""
+"""APEX Kernels - GPU-accelerated compute kernels for trading analytics.
 
-from .rolling_high import (
+Kernels:
+    - gpu_volume_delta_multi: Multi-window volume delta (same windows as rolling_high/low)
+    - gpu_rolling_high: Rolling maximum price over time window
+    - gpu_rolling_low: Rolling minimum price over time window
+    - gpu_grid_search_long_dca: LONG position grid search with DCA support
+    - gpu_grid_search_short_dca: SHORT position grid search with DCA support
+"""
+
+# Multi-Window Volume Delta - same windows as rolling_high/rolling_low
+from .gpu_volume_delta_multi import (
+    volume_delta_multi_gpu,
+    volume_delta_multi_cpu,
+)
+
+# Rolling High - rolling maximum price over time window
+from .gpu_rolling_high import (
+    rolling_high_gpu,
+    rolling_high_gpu_simple,
+    rolling_high_multi_gpu,
     rolling_high_cpu,
     rolling_high_cpu_parallel,
-    rolling_high_gpu,
-    compute_rolling_high,
 )
-from .rolling_low import (
+
+# Rolling Low - rolling minimum price over time window
+from .gpu_rolling_low import (
+    rolling_low_gpu,
+    rolling_low_gpu_simple,
+    rolling_low_multi_gpu,
     rolling_low_cpu,
     rolling_low_cpu_parallel,
-    rolling_low_gpu,
-    compute_rolling_low,
     NO_LOW_SENTINEL,
 )
-from .volume_imbalance import (
-    volume_imbalance_gpu,
-    volume_imbalance_cpu,
-    get_max_trades_for_vram,
-    get_memory_config,
-    compute_num_buckets,
-    compute_price_range_cpu,
+
+# Grid Search LONG DCA - parameter optimization for LONG positions with DCA
+from .gpu_grid_search_long_dca import (
+    grid_search_long_dca_gpu,
+    get_initial_size,
+    get_dca_multiplier,
+    get_max_position,
+    get_params_per_combo,
 )
-from .grid_search import (
-    grid_search_long_gpu,
-    grid_search_short_gpu,
+
+# Grid Search SHORT DCA - parameter optimization for SHORT positions with DCA
+from .gpu_grid_search_short_dca import (
+    grid_search_short_dca_gpu,
+)
+
+# Architecture info getters
+from .gpu_volume_delta_multi import (
+    get_warp_size,
     get_block_size,
     get_warps_per_block,
-    get_warp_size,
-    get_start_idx,
-    get_min_gap,
+    get_sm_count,
 )
-# from .benchmark import run_benchmarks
-# Note: bootstrap is built separately as a shared library, not part of the package
-# from .bootstrap import PyInit_bootstrap
-# from .live_price_move import (
-#     price_move_from_high_cpu,
-#     price_move_from_low_cpu,
-#     find_rolling_high_cpu,
-#     find_rolling_low_cpu,
-#     compute_price_moves_multi_window,
-#     price_move_from_high_window,
-#     price_move_from_low_window,
-# )
-# from .live_volume_imbalance import (
-#     volume_imbalance_cpu,
-#     volume_imbalance_cpu_parallel,
-#     volume_imbalance_window,
-#     volume_imbalance_near_price,
-#     cumulative_delta_from_timestamp,
-#     compute_volume_stats,
-#     VolumeStats,
-# )
