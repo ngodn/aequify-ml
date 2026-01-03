@@ -23,6 +23,10 @@ dependencies = [
     "python-dotenv>=1.2.1",
 ]
 
+[project.urls]
+Repository = "https://github.com/ngodn/aequify-ml"
+Issues = "https://github.com/ngodn/aequify-ml/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
