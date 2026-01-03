@@ -95,6 +95,9 @@ class TradingConfig:
     # Position reconciliation (sync with exchange)
     position_reconciliation_interval_seconds: float = 15.0
 
+    # Stream connection staggering (avoid rate limiting on startup)
+    stream_connection_delay_ms: int = 200  # Delay between WebSocket connections
+
     # Startup behavior
     cancel_orphaned_orders_on_startup: bool = True
     restore_tp_sl_on_startup: bool = True
@@ -143,6 +146,9 @@ class TradingConfig:
             filter_update_interval_seconds=trading.get("filter_update_interval_seconds", 300.0),
             position_reconciliation_interval_seconds=trading.get(
                 "order_reconciliation_interval", 15.0
+            ),
+            stream_connection_delay_ms=trading.get(
+                "stream_connection_delay_ms", 200
             ),
             cancel_orphaned_orders_on_startup=trading.get(
                 "cancel_orphaned_orders_on_startup", True
@@ -380,11 +386,10 @@ class TradingManager:
             await self._update_active_symbols()
 
         # Step 4: Initialize trade streams for active symbols
+        # Start isolated loop first (needed for staggered stream connections)
+        self._loop.start()
         self._init_symbol_registry()
         self._sync_trade_streams()
-
-        # Start isolated loop (for non-CCXT operations like backfill/bootstrap)
-        self._loop.start()
 
         # Start background tasks on the CURRENT loop (engine's loop)
         # IMPORTANT: These tasks call CCXT methods which are tied to the loop
@@ -728,6 +733,7 @@ class TradingManager:
             state = {
                 "is_bootstrapped": True,
                 "source": source,
+                "init_stage": "complete",
                 "long_params": None,
                 "short_params": None,
             }
@@ -819,6 +825,7 @@ class TradingManager:
             state = {
                 "is_bootstrapped": False,
                 "source": "backfill",
+                "init_stage": "backfilling",
                 "backfill_status": f"Importing {progress.current_date}...",
                 "backfill_progress": int(progress.progress_pct),
                 "backfill_current_day": progress.days_processed,
@@ -854,6 +861,41 @@ class TradingManager:
             publisher.publish_apex_state(symbol, state)
         except Exception as e:
             logger.debug(f"Failed to clear backfill progress: {e}")
+
+    def _publish_init_stage(
+        self,
+        symbol: str,
+        stage: str,
+        queue_position: int = 0,
+        queue_total: int = 0,
+    ) -> None:
+        """
+        Publish initialization stage to TUI via PubSub.
+
+        Args:
+            symbol: Trading pair.
+            stage: One of: "queued", "checking_cache", "backfilling", "bootstrapping", "complete"
+            queue_position: Position in initialization queue (1-based).
+            queue_total: Total symbols in queue.
+        """
+        from aequify.core.trading.publisher import get_trading_publisher
+
+        try:
+            publisher = get_trading_publisher()
+            if not publisher.is_connected:
+                return
+
+            state = {
+                "is_bootstrapped": stage == "complete",
+                "init_stage": stage,
+                "init_queue_position": queue_position,
+                "init_queue_total": queue_total,
+            }
+
+            publisher.publish_apex_state(symbol, state)
+            logger.debug(f"[{symbol}] Init stage: {stage}")
+        except Exception as e:
+            logger.debug(f"Failed to publish init stage: {e}")
 
     def _init_apex_live_detection(self) -> None:
         """Initialize APEX live detection components (signal handler + detector manager)."""
@@ -994,11 +1036,15 @@ class TradingManager:
             for symbol in symbols_to_remove:
                 self._symbol_registry.remove(symbol)
 
-            # Start streams for new active symbols
+            # Add new symbols (without starting connections yet)
             symbols_to_add = target_symbols - current_symbols
+            managers_to_start = []
             for symbol in symbols_to_add:
                 try:
-                    self._symbol_registry.add(symbol, demo=self.config.demo, auto_start=True)
+                    manager = self._symbol_registry.add(
+                        symbol, demo=self.config.demo, auto_start=False
+                    )
+                    managers_to_start.append(manager)
                 except ValueError:
                     pass  # Already exists
 
@@ -1008,8 +1054,41 @@ class TradingManager:
                     f"(total: {len(self._symbol_registry.symbols())})"
                 )
 
+            # Schedule staggered connection starts to avoid rate limiting
+            if managers_to_start and self._loop.is_running:
+                delay_ms = self.config.stream_connection_delay_ms
+                self._loop.schedule(
+                    self._staggered_stream_connect(managers_to_start, delay_ms)
+                )
+
         except Exception as e:
             logger.error(f"Failed to sync trade streams: {e}")
+
+    async def _staggered_stream_connect(
+        self, managers: list, delay_ms: int
+    ) -> None:
+        """
+        Connect trade streams with staggered delays to avoid rate limiting.
+
+        Args:
+            managers: List of SymbolManager instances to start.
+            delay_ms: Delay between connections in milliseconds.
+        """
+        delay_s = delay_ms / 1000.0
+        total = len(managers)
+
+        logger.info(f"Starting staggered stream connections: {total} symbols, {delay_ms}ms delay")
+
+        for i, manager in enumerate(managers, 1):
+            try:
+                manager.start()
+                logger.debug(f"[{i}/{total}] Connected stream: {manager.symbol}")
+            except Exception as e:
+                logger.warning(f"Failed to start stream for {manager.symbol}: {e}")
+
+            # Don't delay after the last connection
+            if i < total:
+                await asyncio.sleep(delay_s)
 
     async def _filter_update_loop(self) -> None:
         """
@@ -1648,6 +1727,9 @@ class TradingManager:
         with self._symbol_init_lock:
             logger.info(f"[{symbol}] Starting symbol initialization...")
 
+            # Publish checking_cache stage
+            self._publish_init_stage(symbol, "checking_cache")
+
             try:
                 # Load config for this symbol (with overrides)
                 config = load_apex_config_for_symbol(self._config_path, symbol)
@@ -1780,6 +1862,7 @@ class TradingManager:
                     logger.info(f"[{symbol}] Loaded {len(trades):,} trades for bootstrap")
 
                     # 5. Run bootstrap
+                    self._publish_init_stage(symbol, "bootstrapping")
                     logger.info(f"[{symbol}] Starting bootstrap...")
                     bootstrap_result = await bootstrap_symbol(
                         symbol=symbol,
@@ -1838,6 +1921,10 @@ class TradingManager:
         """
         results: dict[str, "BootstrapResult | None"] = {}
         total = len(symbols)
+
+        # Publish "queued" status for all symbols at the start
+        for i, symbol in enumerate(symbols, 1):
+            self._publish_init_stage(symbol, "queued", queue_position=i, queue_total=total)
 
         for i, symbol in enumerate(symbols, 1):
             if on_progress:
