@@ -1,0 +1,527 @@
+"""
+Optimized Volume Imbalance Kernel - Memory-efficient warp-cooperative scanning.
+
+This implementation uses warp-cooperative direct scanning to achieve
+O(n) memory usage instead of O(n * num_buckets) of the prefix-sum approach.
+
+Architecture:
+    1. One warp (32 threads) per output index
+    2. Each lane scans a portion of the session range
+    3. Accumulate buy/sell volumes for trades within price tolerance
+    4. Warp-level reduction to combine results
+
+Memory: O(n) - only input buffers + output buffer (NO extra allocations)
+Time: O(session_length / WARP_SIZE) per output, fully parallel
+
+Usage:
+    volume_imbalance_gpu(ctx, timestamps, prices, quantities, sides, result,
+                         min_price, max_price, tolerance_pct, n)
+"""
+
+from math import ceildiv, floor, ceil
+from sys import has_amd_gpu_accelerator, has_apple_gpu_accelerator, has_nvidia_gpu_accelerator, has_accelerator
+
+from gpu import global_idx, block_idx, thread_idx, block_dim, lane_id
+from gpu.globals import WARP_SIZE
+from gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from gpu.primitives.warp import lane_group_sum
+from memory import UnsafePointer
+from python import Python, PythonObject
+
+
+# =============================================================================
+# Architecture Constants
+# =============================================================================
+
+@parameter
+fn _get_block_size() -> Int:
+    @parameter
+    if has_apple_gpu_accelerator():
+        return 256
+    elif has_amd_gpu_accelerator():
+        return 256
+    else:
+        return 256
+
+comptime BLOCK_SIZE: Int = _get_block_size()
+
+# Warps per block
+comptime WARPS_PER_BLOCK: Int = BLOCK_SIZE // WARP_SIZE
+
+
+# =============================================================================
+# Session Constants
+# =============================================================================
+
+comptime MS_PER_HOUR: Int64 = 3600000
+comptime MS_PER_DAY: Int64 = 86400000
+
+
+# =============================================================================
+# VRAM Detection (kept for compatibility)
+# =============================================================================
+
+
+fn get_vram_info_nvidia() raises -> Tuple[Int, Int]:
+    """Get VRAM info using pynvml (nvidia-ml-py).
+
+    Returns:
+        Tuple of (free_bytes, total_bytes).
+    """
+    var pynvml = Python.import_module("pynvml")
+    pynvml.nvmlInit()
+
+    var handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    var mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+    var free_bytes = Int(mem_info.free)
+    var total_bytes = Int(mem_info.total)
+
+    pynvml.nvmlShutdown()
+
+    return (free_bytes, total_bytes)
+
+
+fn get_vram_info_mojo() raises -> Tuple[Int, Int]:
+    """Get VRAM info using Mojo DeviceContext.
+
+    Returns:
+        Tuple of (free_bytes, total_bytes).
+    """
+    var ctx = DeviceContext()
+    var mem_info = ctx.get_memory_info()
+    return (Int(mem_info[0]), Int(mem_info[1]))
+
+
+fn get_available_vram_bytes() raises -> Int:
+    """Get available VRAM in bytes.
+
+    Tries pynvml first (more accurate), falls back to Mojo DeviceContext.
+    """
+    try:
+        var info = get_vram_info_nvidia()
+        return info[0]
+    except:
+        try:
+            var info = get_vram_info_mojo()
+            return info[0]
+        except:
+            # Fallback: assume 8GB available
+            return 8 * 1024 * 1024 * 1024
+
+
+fn compute_memory_per_trade(num_buckets: Int) -> Int:
+    """Compute memory required per trade for the NEW approach.
+
+    Memory breakdown per trade (much simpler now):
+        - timestamp: 8 bytes (Int64)
+        - price: 8 bytes (Float64)
+        - quantity: 8 bytes (Float64)
+        - side: 4 bytes (Int32)
+        - result: 8 bytes (Float64)
+
+    Note: No more prefix sums! This is just input + output.
+
+    Args:
+        num_buckets: Ignored (kept for API compatibility).
+
+    Returns:
+        Bytes per trade.
+    """
+    return 8 + 8 + 8 + 4 + 8  # 36 bytes per trade
+
+
+fn compute_num_buckets(tolerance_pct: Float64, price_range_pct: Float64 = 10.0) -> Int:
+    """Compute optimal number of buckets based on tolerance and actual price range.
+
+    Note: This is kept for API compatibility but is no longer used by the kernel.
+    The new kernel doesn't use buckets.
+
+    Args:
+        tolerance_pct: Price tolerance percentage (e.g., 2.5 for 2.5%).
+        price_range_pct: Actual price range in dataset as percentage (default 10%).
+
+    Returns:
+        Number of buckets.
+    """
+    var bucket_size_pct = tolerance_pct / 5.0
+    var num_buckets = Int(ceil(price_range_pct / bucket_size_pct))
+    return max(10, min(100, num_buckets))
+
+
+fn get_max_trades_for_vram(tolerance_pct: Float64 = 2.5, safety_margin: Float64 = 0.85) raises -> Int:
+    """Calculate maximum number of trades that fit in available VRAM.
+
+    With the new memory-efficient kernel, this is MUCH higher than before.
+
+    Args:
+        tolerance_pct: Price tolerance percentage (ignored in new approach).
+        safety_margin: Fraction of VRAM to use (0.85 = 85%).
+
+    Returns:
+        Maximum number of trades.
+    """
+    var available_bytes = get_available_vram_bytes()
+    var usable_bytes = Int(Float64(available_bytes) * safety_margin)
+
+    # New approach: only need input + output buffers
+    var bytes_per_trade = compute_memory_per_trade(0)
+
+    var max_trades = usable_bytes // bytes_per_trade
+
+    return max_trades
+
+
+fn get_memory_config(n_trades: Int, tolerance_pct: Float64 = 2.5) raises -> PythonObject:
+    """Get memory configuration as Python dict for debugging/logging.
+
+    Args:
+        n_trades: Number of trades to process.
+        tolerance_pct: Price tolerance percentage.
+
+    Returns:
+        Python dict with memory configuration.
+    """
+    var bytes_per_trade = compute_memory_per_trade(0)
+    var total_bytes = n_trades * bytes_per_trade
+
+    var available_vram = get_available_vram_bytes()
+    var max_trades = get_max_trades_for_vram(tolerance_pct)
+
+    var info = Python.dict()
+    info.__setitem__(PythonObject("algorithm"), value="warp_cooperative_scan")
+    info.__setitem__(PythonObject("bytes_per_trade"), value=bytes_per_trade)
+    info.__setitem__(PythonObject("total_bytes_required"), value=total_bytes)
+    info.__setitem__(PythonObject("total_gb_required"), value=Float64(total_bytes) / (1024.0 * 1024.0 * 1024.0))
+    info.__setitem__(PythonObject("available_vram_bytes"), value=available_vram)
+    info.__setitem__(PythonObject("available_vram_gb"), value=Float64(available_vram) / (1024.0 * 1024.0 * 1024.0))
+    info.__setitem__(PythonObject("max_trades"), value=max_trades)
+    info.__setitem__(PythonObject("fits_in_vram"), value=n_trades <= max_trades)
+    info.__setitem__(PythonObject("tolerance_pct"), value=tolerance_pct)
+
+    return info
+
+
+# =============================================================================
+# Session Helpers
+# =============================================================================
+
+
+@always_inline
+fn get_previous_session_start_ms(current_ts_ms: Int64) -> Int64:
+    """Get the start timestamp of the previous trading session."""
+    var ms_since_midnight = current_ts_ms % MS_PER_DAY
+    var current_hour = Int32(ms_since_midnight // MS_PER_HOUR)
+    var day_start_ms = current_ts_ms - ms_since_midnight
+
+    var prev_session_hour: Int32 = 17
+    var prev_day_offset: Int64 = 0
+
+    if current_hour >= 20:
+        prev_session_hour = 17
+    elif current_hour >= 17:
+        prev_session_hour = 13
+    elif current_hour >= 13:
+        prev_session_hour = 8
+    elif current_hour >= 8:
+        prev_session_hour = 7
+    elif current_hour >= 7:
+        prev_session_hour = 3
+    elif current_hour >= 3:
+        prev_session_hour = 0
+    elif current_hour >= 0:
+        prev_session_hour = 20
+        prev_day_offset = -MS_PER_DAY
+
+    return day_start_ms + prev_day_offset + Int64(prev_session_hour) * MS_PER_HOUR
+
+
+@always_inline
+fn binary_search_lower_bound(
+    timestamps: UnsafePointer[Int64, MutAnyOrigin],
+    start: Int,
+    end: Int,
+    target: Int64,
+) -> Int:
+    """Binary search to find first index where timestamps[idx] >= target."""
+    var lo = start
+    var hi = end
+
+    while lo < hi:
+        var mid = lo + (hi - lo) // 2
+        if timestamps[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    return lo
+
+
+# =============================================================================
+# Price Range Helper (kept for compatibility)
+# =============================================================================
+
+
+fn compute_price_range_cpu(
+    prices: UnsafePointer[Float64],
+    n: Int,
+) -> Tuple[Float64, Float64]:
+    """Compute min and max prices (CPU)."""
+    if n == 0:
+        return (0.0, 0.0)
+
+    var min_price = prices[0]
+    var max_price = prices[0]
+
+    for i in range(1, n):
+        var p = prices[i]
+        if p < min_price:
+            min_price = p
+        if p > max_price:
+            max_price = p
+
+    return (min_price, max_price)
+
+
+# =============================================================================
+# Warp Reduction Helper
+# =============================================================================
+
+
+@always_inline
+fn warp_reduce_sum_f64(val: Float64) -> Float64:
+    """Warp-level sum reduction using lane_group_sum.
+
+    Uses Float32 internally for compatibility with lane_group_sum,
+    then converts back to Float64.
+    """
+    # lane_group_sum works with Float32, so we use that
+    var val_f32 = Float32(val)
+    var result = lane_group_sum[num_lanes=WARP_SIZE](val_f32)
+    return Float64(result)
+
+
+# =============================================================================
+# Warp-Cooperative Volume Imbalance Kernel
+# =============================================================================
+
+
+fn _volume_imbalance_warp_kernel(
+    timestamps: UnsafePointer[Int64, MutAnyOrigin],
+    prices: UnsafePointer[Float64, MutAnyOrigin],
+    quantities: UnsafePointer[Float64, MutAnyOrigin],
+    sides: UnsafePointer[Int32, MutAnyOrigin],
+    result: UnsafePointer[Float64, MutAnyOrigin],
+    tolerance_pct: Float64,
+    n: Int32,
+):
+    """Warp-cooperative volume imbalance kernel.
+
+    One warp (32 threads) processes each output index cooperatively.
+    Each lane scans a portion of the session range, then warp-level
+    reduction combines the results.
+
+    Memory: O(1) per warp (just registers)
+    Time: O(session_length / WARP_SIZE) per output
+
+    Args:
+        timestamps: Trade timestamps (sorted ascending).
+        prices: Trade prices.
+        quantities: Trade quantities.
+        sides: Trade sides (1 = buy, 0 = sell).
+        result: Output volume imbalance array.
+        tolerance_pct: Price tolerance percentage.
+        n: Number of trades.
+    """
+    # Calculate which output index this warp is responsible for
+    var warp_idx = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(lane_id())
+
+    # Each warp handles one output index
+    var i = warp_idx
+
+    if i >= Int(n):
+        return
+
+    var current_ts = timestamps[i]
+    var current_price = prices[i]
+    var tolerance = current_price * (tolerance_pct / 100.0)
+    var price_low = current_price - tolerance
+    var price_high = current_price + tolerance
+
+    # Get session start timestamp
+    var session_start_ms = get_previous_session_start_ms(current_ts)
+
+    # Binary search to find first index >= session_start_ms
+    # All lanes do this (redundant but simple and fast)
+    var lo = 0
+    var hi = i
+    while lo < hi:
+        var mid = (lo + hi) // 2
+        if timestamps[mid] < session_start_ms:
+            lo = mid + 1
+        else:
+            hi = mid
+    var start_idx = lo
+
+    # If no trades in session before current, result is 0
+    if start_idx >= i:
+        if lane == 0:
+            result[i] = 0.0
+        return
+
+    # Warp-cooperative scan: each lane handles every WARP_SIZE-th element
+    var buy_sum: Float64 = 0.0
+    var sell_sum: Float64 = 0.0
+
+    # Lane k scans indices: start_idx + k, start_idx + k + WARP_SIZE, ...
+    var j = start_idx + lane
+    while j < i:
+        var trade_price = prices[j]
+
+        # Check if price is within tolerance
+        if trade_price >= price_low and trade_price <= price_high:
+            var qty = quantities[j]
+            var side = sides[j]
+
+            if side == 1:
+                buy_sum += qty
+            else:
+                sell_sum += qty
+
+        j += WARP_SIZE
+
+    # Warp-level reduction to combine all lanes' partial sums
+    var total_buy = warp_reduce_sum_f64(buy_sum)
+    var total_sell = warp_reduce_sum_f64(sell_sum)
+
+    # Lane 0 writes the final result
+    if lane == 0:
+        var total = total_buy + total_sell
+        if total > 0.0:
+            result[i] = (total_buy - total_sell) / total * 100.0
+        else:
+            result[i] = 0.0
+
+
+# =============================================================================
+# Main GPU Function
+# =============================================================================
+
+
+fn volume_imbalance_gpu(
+    ctx: DeviceContext,
+    timestamps_dev: DeviceBuffer[DType.int64],
+    prices_dev: DeviceBuffer[DType.float64],
+    quantities_dev: DeviceBuffer[DType.float64],
+    sides_dev: DeviceBuffer[DType.int32],
+    result_dev: DeviceBuffer[DType.float64],
+    min_price: Float64,
+    max_price: Float64,
+    tolerance_pct: Float64,
+    n: Int,
+) raises:
+    """Run memory-efficient volume imbalance computation on GPU.
+
+    Uses warp-cooperative scanning - NO extra memory allocations!
+
+    Memory: O(n) total (just input + output buffers passed in)
+    Time: O(n * session_length / WARP_SIZE) but fully parallel
+
+    Args:
+        ctx: GPU device context.
+        timestamps_dev: Device buffer with timestamps.
+        prices_dev: Device buffer with prices.
+        quantities_dev: Device buffer with quantities.
+        sides_dev: Device buffer with sides.
+        result_dev: Device buffer for output.
+        min_price: Minimum price in dataset (unused, kept for API compat).
+        max_price: Maximum price in dataset (unused, kept for API compat).
+        tolerance_pct: Price tolerance percentage.
+        n: Number of trades.
+    """
+    # Launch one warp per output index
+    # Grid: n warps = n * WARP_SIZE threads
+    # Blocks: BLOCK_SIZE threads each = WARPS_PER_BLOCK warps
+    var num_warps = n
+    var num_blocks = ceildiv(num_warps, WARPS_PER_BLOCK)
+
+    ctx.enqueue_function_checked[_volume_imbalance_warp_kernel, _volume_imbalance_warp_kernel](
+        timestamps_dev.unsafe_ptr(),
+        prices_dev.unsafe_ptr(),
+        quantities_dev.unsafe_ptr(),
+        sides_dev.unsafe_ptr(),
+        result_dev.unsafe_ptr(),
+        tolerance_pct,
+        Int32(n),
+        grid_dim=num_blocks,
+        block_dim=BLOCK_SIZE,
+    )
+
+    # No intermediate buffers to free! Just the kernel launch.
+
+
+# =============================================================================
+# CPU Reference Implementation (updated to match new algorithm)
+# =============================================================================
+
+
+fn volume_imbalance_cpu[
+    origin: MutOrigin,
+](
+    timestamps: UnsafePointer[Int64],
+    prices: UnsafePointer[Float64],
+    quantities: UnsafePointer[Float64],
+    sides: UnsafePointer[Int32],
+    result: UnsafePointer[Float64, origin],
+    min_price: Float64,
+    max_price: Float64,
+    tolerance_pct: Float64,
+    n: Int,
+):
+    """CPU reference implementation using direct scanning.
+
+    Uses the same algorithm as GPU but runs sequentially for validation.
+    """
+    for i in range(n):
+        var current_ts = timestamps[i]
+        var current_price = prices[i]
+        var tolerance = current_price * (tolerance_pct / 100.0)
+        var price_low = current_price - tolerance
+        var price_high = current_price + tolerance
+
+        var session_start_ms = get_previous_session_start_ms(current_ts)
+
+        # Binary search for start index
+        var lo = 0
+        var hi = i
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if timestamps[mid] < session_start_ms:
+                lo = mid + 1
+            else:
+                hi = mid
+        var start_idx = lo
+
+        if start_idx >= i:
+            result[i] = 0.0
+            continue
+
+        # Direct scan
+        var buy_sum: Float64 = 0.0
+        var sell_sum: Float64 = 0.0
+
+        for j in range(start_idx, i):
+            var trade_price = prices[j]
+            if trade_price >= price_low and trade_price <= price_high:
+                var qty = quantities[j]
+                if sides[j] == 1:
+                    buy_sum += qty
+                else:
+                    sell_sum += qty
+
+        var total = buy_sum + sell_sum
+        if total > 0.0:
+            result[i] = (buy_sum - sell_sum) / total * 100.0
+        else:
+            result[i] = 0.0
