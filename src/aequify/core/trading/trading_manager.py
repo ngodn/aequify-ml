@@ -33,11 +33,14 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from aequify.logging import get_logger
 from aequify.runtime import IsolatedLoop
+
+# Session open hours in UTC (sorted for easy lookup)
+SESSION_OPEN_HOURS: list[int] = [0, 3, 7, 8, 13, 17, 20]
 
 if TYPE_CHECKING:
     from aequify.core.apex import APEX, BootstrapResult
@@ -850,8 +853,10 @@ class TradingManager:
             # NOTE: Do NOT reset is_bootstrapped here - this is a partial update
             # that should only clear backfill progress fields. The TUI handler
             # will preserve existing bootstrap state when receiving this.
+            # init_stage is set to empty to clear browser status (bootstrapping will set it next)
             state = {
                 "source": "bootstrap",
+                "init_stage": "",
                 "backfill_status": "",
                 "backfill_progress": 0,
                 "backfill_current_day": 0,
@@ -1092,21 +1097,67 @@ class TradingManager:
 
     async def _filter_update_loop(self) -> None:
         """
-        Background loop that periodically updates active symbols.
+        Background loop that updates active symbols at session opens.
 
-        Runs filter pipeline at configured interval.
+        Runs filter pipeline at each forex session open:
+        - Tokyo: 00:00 UTC
+        - Mumbai: 03:00 UTC
+        - Frankfurt: 07:00 UTC
+        - London: 08:00 UTC
+        - NY-London: 13:00 UTC
+        - New York: 17:00 UTC
+        - Sydney: 20:00 UTC
         """
-        interval_s = self.config.filter_update_interval_seconds
-
         while self._running:
             try:
-                await asyncio.sleep(interval_s)
+                # Calculate seconds until next session open
+                sleep_seconds = self._seconds_until_next_session_open()
+                next_session_time = datetime.now(timezone.utc) + timedelta(seconds=sleep_seconds)
+                logger.info(
+                    f"Filter update scheduled for next session open at "
+                    f"{next_session_time.strftime('%H:%M UTC')} (in {sleep_seconds // 60:.0f}m)"
+                )
+
+                await asyncio.sleep(sleep_seconds)
                 await self._update_active_symbols()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Filter update error: {e}")
-                await asyncio.sleep(interval_s)
+                # On error, wait 5 minutes before retrying
+                await asyncio.sleep(300)
+
+    def _seconds_until_next_session_open(self) -> float:
+        """
+        Calculate seconds until the next forex session opens.
+
+        Returns:
+            Seconds until the next session open hour.
+        """
+        now = datetime.now(timezone.utc)
+        current_hour = now.hour
+        current_minute = now.minute
+        current_second = now.second
+
+        # Find next session open hour
+        next_hour = None
+        for hour in SESSION_OPEN_HOURS:
+            if hour > current_hour or (hour == current_hour and current_minute == 0 and current_second < 5):
+                next_hour = hour
+                break
+
+        # If no session left today, next is tomorrow's first session (00:00)
+        if next_hour is None:
+            next_hour = SESSION_OPEN_HOURS[0]  # 00:00 tomorrow
+            hours_until = (24 - current_hour) + next_hour
+        else:
+            hours_until = next_hour - current_hour
+
+        # Calculate total seconds (subtract current minutes/seconds)
+        seconds_until = (hours_until * 3600) - (current_minute * 60) - current_second
+
+        # Ensure at least 10 seconds to avoid tight loops
+        return max(10.0, float(seconds_until))
 
     async def _position_reconciliation_loop(self) -> None:
         """
