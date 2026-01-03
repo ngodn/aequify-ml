@@ -1,17 +1,20 @@
 """
 APEX Live Detector - Real-time signal detection from trade stream.
 
-Simple incremental detection like the old project:
-1. Track rolling high/low per time window on each trade
-2. Calculate volume imbalance at current price
+Signal detection using same logic as bootstrap GPU kernels:
+1. Track rolling high/low per time window
+2. Calculate volume delta over SAME time window
 3. Compare against bootstrap thresholds
 4. Emit signal when conditions met
+
+Volume delta is calculated as: (buy_volume - sell_volume) / total_volume * 100
+This matches the gpu_volume_delta_multi kernel in bootstrap.
 
 Architecture:
     Trade Stream (via SymbolManager)
         └─ APEXLiveDetector.on_trade()
             ├─ Update rolling high/low (per time window)
-            ├─ Calculate volume delta at current price
+            ├─ Update volume delta (per time window - SAME window)
             └─ Check signals (compare vs bootstrap thresholds)
                 └─ APEXSignalHandler.on_signal_state()
 
@@ -52,12 +55,8 @@ logger = get_logger(__name__)
 class LiveDetectorConfig:
     """Configuration for live signal detection."""
 
-    # Price tolerance for volume imbalance (order flow style)
-    # Only sum buy/sell at trades within X% of current price
-    imbalance_price_tolerance_pct: float = 1.0
-
-    # Maximum trades to keep in memory for imbalance calculation
-    max_trades_for_imbalance: int = 100000
+    # Maximum trades to keep in memory for volume delta calculation
+    max_trades_buffer: int = 500000
 
     # Signal offset (triggers slightly before/after threshold)
     long_signal_offset: float = 0.0  # Added to price_move threshold
@@ -69,35 +68,44 @@ class LiveDetectorConfig:
         apex_cfg = config.get("engines", {}).get("apex", {})
 
         return cls(
-            imbalance_price_tolerance_pct=apex_cfg.get("imbalance_price_tolerance_pct", 1.0),
-            max_trades_for_imbalance=apex_cfg.get("max_trades_for_imbalance", 100000),
+            max_trades_buffer=apex_cfg.get("max_trades_buffer", 500000),
             long_signal_offset=apex_cfg.get("bootstrap", {}).get("long", {}).get("signal_offset", 0.0),
             short_signal_offset=apex_cfg.get("bootstrap", {}).get("short", {}).get("signal_offset", 0.0),
         )
 
 
 # =============================================================================
-# Trade Record for Imbalance Calculation
+# Trade Record
 # =============================================================================
 
 
-@dataclass
+@dataclass(slots=True)
 class TradeRecord:
-    """Minimal trade record for imbalance calculation."""
+    """Minimal trade record for rolling calculations."""
 
     timestamp_ms: int
     price: float
-    buy_qty: float  # Quantity if taker bought
-    sell_qty: float  # Quantity if taker sold
+    buy_qty: float  # Quantity if taker bought (is_buyer_maker=False)
+    sell_qty: float  # Quantity if taker sold (is_buyer_maker=True)
 
 
 # =============================================================================
-# Rolling High/Low Tracker
+# Rolling Window Tracker (combines extreme + volume delta)
 # =============================================================================
 
 
-class RollingExtreme:
-    """Tracks rolling high or low within a time window."""
+class RollingWindowTracker:
+    """
+    Tracks rolling metrics within a time window.
+
+    Tracks both:
+    - Rolling extreme (high or low)
+    - Volume delta over the SAME window
+
+    This matches how bootstrap GPU kernels work:
+    - rolling_high/rolling_low uses window X
+    - volume_delta_multi uses the SAME window X
+    """
 
     def __init__(self, window_ms: int, is_high: bool = True):
         """
@@ -107,39 +115,67 @@ class RollingExtreme:
         """
         self.window_ms = window_ms
         self.is_high = is_high
-        self._data: deque[tuple[int, float]] = deque()  # (timestamp_ms, price)
-        self._value: float = 0.0 if is_high else float("inf")
 
-    def update(self, timestamp_ms: int, price: float) -> None:
+        # Store (timestamp_ms, price, buy_qty, sell_qty)
+        self._data: deque[tuple[int, float, float, float]] = deque()
+
+        # Cached values
+        self._extreme_value: float = 0.0 if is_high else float("inf")
+        self._total_buy: float = 0.0
+        self._total_sell: float = 0.0
+
+    def update(self, timestamp_ms: int, price: float, buy_qty: float, sell_qty: float) -> None:
         """Update with new trade."""
-        # Remove stale entries
+        # Remove stale entries and adjust totals
         cutoff = timestamp_ms - self.window_ms
         while self._data and self._data[0][0] < cutoff:
-            self._data.popleft()
+            old = self._data.popleft()
+            self._total_buy -= old[2]
+            self._total_sell -= old[3]
 
         # Add new entry
-        self._data.append((timestamp_ms, price))
+        self._data.append((timestamp_ms, price, buy_qty, sell_qty))
+        self._total_buy += buy_qty
+        self._total_sell += sell_qty
 
         # Recompute extreme (could optimize with monotonic deque but simple is fine)
-        if self.is_high:
-            self._value = max(p for _, p in self._data) if self._data else 0.0
+        if self._data:
+            if self.is_high:
+                self._extreme_value = max(p for _, p, _, _ in self._data)
+            else:
+                self._extreme_value = min(p for _, p, _, _ in self._data)
         else:
-            self._value = min(p for _, p in self._data) if self._data else float("inf")
+            self._extreme_value = 0.0 if self.is_high else float("inf")
 
     @property
-    def value(self) -> float:
+    def extreme_value(self) -> float:
         """Current rolling high/low value."""
-        return self._value
+        return self._extreme_value
+
+    @property
+    def volume_delta(self) -> float:
+        """
+        Volume delta over this window.
+
+        Returns: (buy - sell) / total * 100
+        - Negative = selling pressure (more sells than buys)
+        - Positive = buying pressure (more buys than sells)
+        """
+        total = self._total_buy + self._total_sell
+        if total <= 0:
+            return 0.0
+        return ((self._total_buy - self._total_sell) / total) * 100.0
 
     def price_move_pct(self, current_price: float) -> float:
-        """Calculate price move percentage from extreme.
+        """
+        Calculate price move percentage from extreme.
 
         For high: (current - high) / high * 100 (negative when below high)
         For low: (current - low) / low * 100 (positive when above low)
         """
-        if self._value <= 0 or self._value == float("inf"):
+        if self._extreme_value <= 0 or self._extreme_value == float("inf"):
             return 0.0
-        return (current_price - self._value) / self._value * 100.0
+        return (current_price - self._extreme_value) / self._extreme_value * 100.0
 
 
 # =============================================================================
@@ -149,11 +185,11 @@ class RollingExtreme:
 
 class APEXLiveDetector:
     """
-    Real-time signal detector - simple incremental approach.
+    Real-time signal detector using same logic as bootstrap.
 
     On each trade:
     1. Update rolling high/low per time window
-    2. Calculate volume imbalance at current price
+    2. Update volume delta per SAME time window
     3. Compare against bootstrap thresholds
     4. Emit signal if conditions met
     """
@@ -179,24 +215,20 @@ class APEXLiveDetector:
         self.signal_handler = signal_handler
         self.config = config or LiveDetectorConfig()
 
-        # Rolling high trackers (one per time window, for LONG)
-        # Price drop from high triggers LONG
-        self._rolling_highs: dict[int, RollingExtreme] = {}
-
-        # Rolling low trackers (one per time window, for SHORT)
-        # Price rise from low triggers SHORT
-        self._rolling_lows: dict[int, RollingExtreme] = {}
+        # Rolling trackers - one HIGH and one LOW per time window
+        # HIGH tracker for LONG signals (price drop from high + selling pressure)
+        # LOW tracker for SHORT signals (price rise from low + buying pressure)
+        self._high_trackers: dict[int, RollingWindowTracker] = {}
+        self._low_trackers: dict[int, RollingWindowTracker] = {}
 
         # Initialize trackers for each time window from APEX config
         for tw_ms in apex.config.time_windows_ms:
-            self._rolling_highs[tw_ms] = RollingExtreme(tw_ms, is_high=True)
-            self._rolling_lows[tw_ms] = RollingExtreme(tw_ms, is_high=False)
-
-        # Trade buffer for imbalance calculation
-        self._trades: deque[TradeRecord] = deque(maxlen=self.config.max_trades_for_imbalance)
+            self._high_trackers[tw_ms] = RollingWindowTracker(tw_ms, is_high=True)
+            self._low_trackers[tw_ms] = RollingWindowTracker(tw_ms, is_high=False)
 
         # Current state
         self._current_price: float = 0.0
+        self._current_timestamp_ms: int = 0
         self._trade_count: int = 0
 
         # Stats
@@ -214,8 +246,6 @@ class APEXLiveDetector:
         """
         Process a trade and check for signals.
 
-        Called on each trade from the stream.
-
         Args:
             price: Trade price.
             quantity: Trade quantity.
@@ -223,131 +253,74 @@ class APEXLiveDetector:
             is_buyer_maker: True if buyer was maker (taker sold).
         """
         self._current_price = price
+        self._current_timestamp_ms = timestamp_ms
         self._trade_count += 1
 
-        # Update rolling highs and lows
-        for rolling_high in self._rolling_highs.values():
-            rolling_high.update(timestamp_ms, price)
-        for rolling_low in self._rolling_lows.values():
-            rolling_low.update(timestamp_ms, price)
-
-        # Add to trade buffer for imbalance calculation
-        # is_buyer_maker=True means taker sold
+        # is_buyer_maker=True means taker sold (selling pressure)
         buy_qty = quantity if not is_buyer_maker else 0.0
         sell_qty = quantity if is_buyer_maker else 0.0
 
-        self._trades.append(TradeRecord(
-            timestamp_ms=timestamp_ms,
-            price=price,
-            buy_qty=buy_qty,
-            sell_qty=sell_qty,
-        ))
+        # Update all trackers with the trade
+        for tracker in self._high_trackers.values():
+            tracker.update(timestamp_ms, price, buy_qty, sell_qty)
+        for tracker in self._low_trackers.values():
+            tracker.update(timestamp_ms, price, buy_qty, sell_qty)
 
         # Check signals if bootstrapped
         if self.apex.is_bootstrapped:
             self._check_signals()
-
-    def _calculate_imbalance_at_price(self, target_price: float) -> float:
-        """
-        Calculate volume imbalance at trades near target price.
-
-        Footprint/order flow style:
-        - Sum buy/sell volumes at trades within price tolerance
-        - Returns (buy - sell) / total * 100
-
-        Args:
-            target_price: Price to calculate imbalance around.
-
-        Returns:
-            Volume delta percentage (-100 to +100).
-            Negative = selling pressure, Positive = buying pressure.
-        """
-        if target_price <= 0 or not self._trades:
-            return 0.0
-
-        tolerance = target_price * (self.config.imbalance_price_tolerance_pct / 100.0)
-        price_low = target_price - tolerance
-        price_high = target_price + tolerance
-
-        total_buy = 0.0
-        total_sell = 0.0
-
-        for trade in self._trades:
-            if price_low <= trade.price <= price_high:
-                total_buy += trade.buy_qty
-                total_sell += trade.sell_qty
-
-        total_volume = total_buy + total_sell
-        if total_volume <= 0:
-            return 0.0
-
-        return ((total_buy - total_sell) / total_volume) * 100.0
 
     def _check_signals(self) -> None:
         """Check if LONG or SHORT signal conditions are met."""
         long_params = self.apex.params.long
         short_params = self.apex.params.short
 
-        # Get volume delta at current price
-        volume_delta = self._calculate_imbalance_at_price(self._current_price)
-
         # Check LONG signal
+        # Uses the time_window from bootstrap result
         if long_params:
-            # Find best price move from high (across all time windows)
-            # LONG wants price to DROP, so we look for most negative price_move
-            best_pm_from_high = 0.0
-            best_tw_high = 0
+            tw_ms = long_params.time_window
+            tracker = self._high_trackers.get(tw_ms)
 
-            for tw_ms, rolling_high in self._rolling_highs.items():
-                pm = rolling_high.price_move_pct(self._current_price)
-                if pm < best_pm_from_high:
-                    best_pm_from_high = pm
-                    best_tw_high = tw_ms
+            if tracker:
+                pm = tracker.price_move_pct(self._current_price)
+                delta = tracker.volume_delta
 
-            # Check conditions
-            # price_move threshold is negative (e.g., -2.0 means drop 2%)
-            # volume_delta threshold is negative (e.g., -70 means selling pressure)
-            long_trigger = long_params.price_move + self.config.long_signal_offset
-            price_ok = best_pm_from_high <= long_trigger
-            imbalance_ok = volume_delta <= long_params.delta_threshold
+                # LONG: price drops (negative pm) + selling pressure (negative delta)
+                long_trigger = long_params.price_move + self.config.long_signal_offset
+                price_ok = pm <= long_trigger
+                delta_ok = delta <= long_params.delta_threshold
 
-            if price_ok and imbalance_ok:
-                self._emit_signal(
-                    side="LONG",
-                    price_move=best_pm_from_high,
-                    volume_delta=volume_delta,
-                    time_window_ms=best_tw_high,
-                    params=long_params,
-                )
+                if price_ok and delta_ok:
+                    self._emit_signal(
+                        side="LONG",
+                        price_move=pm,
+                        volume_delta=delta,
+                        time_window_ms=tw_ms,
+                        params=long_params,
+                    )
 
         # Check SHORT signal
         if short_params:
-            # Find best price move from low (across all time windows)
-            # SHORT wants price to RISE, so we look for most positive price_move
-            best_pm_from_low = 0.0
-            best_tw_low = 0
+            tw_ms = short_params.time_window
+            tracker = self._low_trackers.get(tw_ms)
 
-            for tw_ms, rolling_low in self._rolling_lows.items():
-                pm = rolling_low.price_move_pct(self._current_price)
-                if pm > best_pm_from_low:
-                    best_pm_from_low = pm
-                    best_tw_low = tw_ms
+            if tracker:
+                pm = tracker.price_move_pct(self._current_price)
+                delta = tracker.volume_delta
 
-            # Check conditions
-            # price_move threshold is positive (e.g., +2.0 means rise 2%)
-            # volume_delta threshold is positive (e.g., +70 means buying pressure)
-            short_trigger = short_params.price_move - self.config.short_signal_offset
-            price_ok = best_pm_from_low >= short_trigger
-            imbalance_ok = volume_delta >= short_params.delta_threshold
+                # SHORT: price rises (positive pm) + buying pressure (positive delta)
+                short_trigger = short_params.price_move - self.config.short_signal_offset
+                price_ok = pm >= short_trigger
+                delta_ok = delta >= short_params.delta_threshold
 
-            if price_ok and imbalance_ok:
-                self._emit_signal(
-                    side="SHORT",
-                    price_move=best_pm_from_low,
-                    volume_delta=volume_delta,
-                    time_window_ms=best_tw_low,
-                    params=short_params,
-                )
+                if price_ok and delta_ok:
+                    self._emit_signal(
+                        side="SHORT",
+                        price_move=pm,
+                        volume_delta=delta,
+                        time_window_ms=tw_ms,
+                        params=short_params,
+                    )
 
     def _emit_signal(
         self,
@@ -409,90 +382,85 @@ class APEXLiveDetector:
             "trade_count": self._trade_count,
             "current_price": self._current_price,
             "signals_emitted": self._signals_emitted,
-            "trades_buffered": len(self._trades),
-            "time_windows": list(self._rolling_highs.keys()),
+            "time_windows": list(self._high_trackers.keys()),
         }
 
     def get_current_metrics(self) -> dict[str, Any]:
         """
         Get current live metrics for TUI display.
 
-        Returns dict with fields matching APEXTUIState:
-            current_price, rolling_high, rolling_low,
-            price_move_from_high, price_move_from_low,
-            long_volume_delta, short_volume_delta,
-            long_signal_ready, short_signal_ready,
-            long_signal_offset, short_signal_offset,
-            price_window, imbalance_price_pct
+        Returns dict with fields matching APEXTUIState.
+        Volume delta is now calculated per-direction using the same
+        time window as the bootstrap result.
         """
         if self._current_price <= 0:
             return {}
 
-        volume_delta = self._calculate_imbalance_at_price(self._current_price)
-
-        # Get best price moves (best means closest to triggering)
-        # LONG: most negative from high, SHORT: most positive from low
-        best_pm_from_high = 0.0
-        best_rolling_high = 0.0
-        best_tw_high = 0
-
-        for tw_ms, rh in self._rolling_highs.items():
-            pm = rh.price_move_pct(self._current_price)
-            if pm < best_pm_from_high:
-                best_pm_from_high = pm
-                best_rolling_high = rh.value
-                best_tw_high = tw_ms
-
-        best_pm_from_low = 0.0
-        best_rolling_low = float("inf")
-        best_tw_low = 0
-
-        for tw_ms, rl in self._rolling_lows.items():
-            pm = rl.price_move_pct(self._current_price)
-            if pm > best_pm_from_low:
-                best_pm_from_low = pm
-                best_rolling_low = rl.value
-                best_tw_low = tw_ms
-
-        # Get params for signal readiness check
         long_params = self.apex.params.long
         short_params = self.apex.params.short
+
+        # LONG metrics - from the bootstrap time_window
+        long_tw = long_params.time_window if long_params else 0
+        long_tracker = self._high_trackers.get(long_tw)
+
+        if long_tracker:
+            pm_from_high = long_tracker.price_move_pct(self._current_price)
+            rolling_high = long_tracker.extreme_value
+            long_delta = long_tracker.volume_delta
+        else:
+            pm_from_high = 0.0
+            rolling_high = self._current_price
+            long_delta = 0.0
+
+        # SHORT metrics - from the bootstrap time_window
+        short_tw = short_params.time_window if short_params else 0
+        short_tracker = self._low_trackers.get(short_tw)
+
+        if short_tracker:
+            pm_from_low = short_tracker.price_move_pct(self._current_price)
+            rolling_low = short_tracker.extreme_value
+            short_delta = short_tracker.volume_delta
+        else:
+            pm_from_low = 0.0
+            rolling_low = self._current_price
+            short_delta = 0.0
 
         # Check signal readiness
         long_ready = False
         short_ready = False
 
-        if long_params:
+        if long_params and long_tracker:
             long_trigger = long_params.price_move + self.config.long_signal_offset
             long_ready = (
-                best_pm_from_high <= long_trigger
-                and volume_delta <= long_params.delta_threshold
+                pm_from_high <= long_trigger
+                and long_delta <= long_params.delta_threshold
             )
 
-        if short_params:
+        if short_params and short_tracker:
             short_trigger = short_params.price_move - self.config.short_signal_offset
             short_ready = (
-                best_pm_from_low >= short_trigger
-                and volume_delta >= short_params.delta_threshold
+                pm_from_low >= short_trigger
+                and short_delta >= short_params.delta_threshold
             )
 
         return {
             "symbol": self.symbol,
             "current_price": self._current_price,
-            "rolling_high": best_rolling_high if best_rolling_high > 0 else self._current_price,
-            "rolling_low": best_rolling_low if best_rolling_low < float("inf") else self._current_price,
-            "price_move_from_high": best_pm_from_high,
-            "price_move_from_low": best_pm_from_low,
-            "price_window": best_tw_high or best_tw_low,
-            # Volume delta - same value for both since it's at current price
-            "long_volume_delta": volume_delta,
-            "short_volume_delta": volume_delta,
-            "imbalance_price_pct": self.config.imbalance_price_tolerance_pct,
+            "rolling_high": rolling_high if rolling_high > 0 else self._current_price,
+            "rolling_low": rolling_low if rolling_low < float("inf") else self._current_price,
+            "price_move_from_high": pm_from_high,
+            "price_move_from_low": pm_from_low,
+            # Volume delta is now per-direction, using same window as rolling extreme
+            "long_volume_delta": long_delta,
+            "short_volume_delta": short_delta,
             # Signal state
             "long_signal_ready": long_ready,
             "short_signal_ready": short_ready,
             "long_signal_offset": self.config.long_signal_offset,
             "short_signal_offset": self.config.short_signal_offset,
+            # Time windows from bootstrap
+            "long_time_window": long_tw,
+            "short_time_window": short_tw,
         }
 
 
