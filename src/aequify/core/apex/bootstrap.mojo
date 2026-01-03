@@ -12,14 +12,18 @@ Architecture-adaptive constants for NVIDIA/AMD/Apple GPUs.
 """
 
 from math import ceildiv
+from sys import stderr
 from time import perf_counter_ns
 
 from gpu.host import DeviceContext
 from gpu.globals import WARP_SIZE
+from logger import Logger, Level
 from memory import memcpy, UnsafePointer
 from python import Python, PythonObject
 from python.bindings import PythonModuleBuilder
 from python._cpython import GILReleased
+
+
 
 # Import from kernels package (built separately)
 from kernels import (
@@ -178,10 +182,16 @@ fn bootstrap_internal(
     var py = Python()
     var np = Python.import_module("numpy")
 
+    # Create logger (works inside GIL-released blocks)
+    var log = Logger[Level.DEBUG](stderr, prefix="[MOJO] ")
+
     var n = Int(timestamps.shape[0])
     var n_windows = Int(len(time_windows_ms))
     var n_long = Int(long_param_grid.shape[0])
     var n_short = Int(short_param_grid.shape[0])
+
+    # Log key parameters (Mojo logger works with or without GIL)
+    # log.debug("Bootstrap params: n=", n, " n_windows=", n_windows, " n_long=", n_long, " n_short=", n_short)
 
     # Ensure arrays are contiguous and correct dtype
     var ts_arr = np.ascontiguousarray(timestamps, dtype=np.int64)
@@ -304,10 +314,12 @@ fn bootstrap_internal(
         ctx.enqueue_copy(dst_buf=short_params_dev, src_buf=short_params_host)
 
         ctx.synchronize()
+        # log.debug("STEP 2 complete: data transferred to GPU")
 
         # ---------------------------------------------------------------------
         # STEP 3: Compute volume imbalance on GPU (optimized prefix-sum version)
         # ---------------------------------------------------------------------
+        # log.debug("STEP 3: starting volume imbalance...")
         var imbalance_dev = ctx.enqueue_create_buffer[DType.float64](n)
 
         volume_imbalance_gpu(
@@ -323,42 +335,54 @@ fn bootstrap_internal(
             n,
         )
         ctx.synchronize()
+        # log.debug("STEP 3 complete: volume imbalance done")
 
         # ---------------------------------------------------------------------
         # STEP 4: Compute rolling highs/lows on GPU
         # ---------------------------------------------------------------------
+        # log.debug("STEP 4: starting rolling high/low...")
         var rolling_size = n_windows * n
-        var rh_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
-        var rl_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
+        var rolling_mb = (rolling_size * 8 * 2) // (1024 * 1024)
+        # log.debug("rolling_size=", rolling_size, " (~", rolling_mb, "MB)")
+
+        # Create combined HOST buffers to accumulate results (can't memcpy to device!)
+        var rh_host = ctx.enqueue_create_host_buffer[DType.float64](rolling_size)
+        var rl_host = ctx.enqueue_create_host_buffer[DType.float64](rolling_size)
 
         for w_idx in range(n_windows):
             var window_ms = windows[w_idx]
+            # log.debug("STEP 4: window ", w_idx, " window_ms=", window_ms)
 
-            # Create sub-buffers for this window's results
-            # Note: We need to create separate buffers and copy, or use offset
-            # For simplicity, we'll create temp buffers and copy
+            # Create device buffers for this window's results
+            # log.debug("  allocating window buffers...")
             var rh_window_dev = ctx.enqueue_create_buffer[DType.float64](n)
             var rl_window_dev = ctx.enqueue_create_buffer[DType.float64](n)
 
+            # log.debug("  running rolling_high_gpu...")
             rolling_high_gpu(ctx, ts_dev, px_dev, rh_window_dev, window_ms, n)
+            # log.debug("  running rolling_low_gpu...")
             rolling_low_gpu(ctx, ts_dev, px_dev, rl_window_dev, window_ms, n)
+            # log.debug("  kernels launched, creating temp host buffers...")
 
-            # Copy to the correct offset in the combined buffer
-            var offset = w_idx * n
+            # Create temp host buffers for this window
             var rh_host_temp = ctx.enqueue_create_host_buffer[DType.float64](n)
             var rl_host_temp = ctx.enqueue_create_host_buffer[DType.float64](n)
+
+            # log.debug("  enqueueing copy device->host...")
             ctx.enqueue_copy(dst_buf=rh_host_temp, src_buf=rh_window_dev)
             ctx.enqueue_copy(dst_buf=rl_host_temp, src_buf=rl_window_dev)
             ctx.synchronize()
+            # log.debug("  sync done, memcpy to combined host buffer...")
 
-            # Copy to combined buffer at offset
+            # Copy to combined HOST buffer at offset (host-to-host memcpy is safe)
+            var offset = w_idx * n
             memcpy(
-                dest=rh_dev.unsafe_ptr().offset(offset).bitcast[UInt8](),
+                dest=rh_host.unsafe_ptr().offset(offset).bitcast[UInt8](),
                 src=rh_host_temp.unsafe_ptr().bitcast[UInt8](),
                 count=n * 8,
             )
             memcpy(
-                dest=rl_dev.unsafe_ptr().offset(offset).bitcast[UInt8](),
+                dest=rl_host.unsafe_ptr().offset(offset).bitcast[UInt8](),
                 src=rl_host_temp.unsafe_ptr().bitcast[UInt8](),
                 count=n * 8,
             )
@@ -367,12 +391,21 @@ fn bootstrap_internal(
             _ = rl_window_dev^
             _ = rh_host_temp^
             _ = rl_host_temp^
+            # log.debug("STEP 4: window ", w_idx, " done")
 
+        # Now copy combined host buffers to device
+        # log.debug("STEP 4: copying combined buffers to device...")
+        var rh_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
+        var rl_dev = ctx.enqueue_create_buffer[DType.float64](rolling_size)
+        ctx.enqueue_copy(dst_buf=rh_dev, src_buf=rh_host)
+        ctx.enqueue_copy(dst_buf=rl_dev, src_buf=rl_host)
         ctx.synchronize()
+        # log.debug("STEP 4 complete: rolling high/low done")
 
         # ---------------------------------------------------------------------
         # STEP 5: Run LONG grid search on GPU
         # ---------------------------------------------------------------------
+        # log.debug("STEP 5: starting LONG grid search (", n_long, " combos)...")
         var long_start_ns = perf_counter_ns()
 
         var long_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_long)
@@ -424,10 +457,12 @@ fn bootstrap_internal(
             src=long_pnl_host.unsafe_ptr().bitcast[UInt8](),
             count=n_long * 8,
         )
+        # log.debug("STEP 5 complete: LONG grid search done")
 
         # ---------------------------------------------------------------------
         # STEP 6: Run SHORT grid search on GPU
         # ---------------------------------------------------------------------
+        # log.debug("STEP 6: starting SHORT grid search (", n_short, " combos)...")
         var short_start_ns = perf_counter_ns()
 
         var short_entries_dev = ctx.enqueue_create_buffer[DType.int32](n_short)
@@ -479,6 +514,8 @@ fn bootstrap_internal(
             src=short_pnl_host.unsafe_ptr().bitcast[UInt8](),
             count=n_short * 8,
         )
+        # log.debug("STEP 6 complete: SHORT grid search done")
+        # log.debug("All GPU computation complete, cleaning up...")
 
         # ---------------------------------------------------------------------
         # STEP 7: Free GPU memory
