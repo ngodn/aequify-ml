@@ -7,9 +7,7 @@
 OSS version of original aequify rewritten in Python + Mojo.
 
 <p align="center">
-  <a href="https://github.com/ngodn/aequify-ml/raw/refs/heads/senpai/aq-oss-tui.mp4">
-    <img src="aq--logo-icon.png" alt="Watch demo" width="600" />
-  </a>
+  <img src="aq-oss-tui.gif" alt="aequify demo" height="400" />
 </p>
 
 ## Supported Exchange
