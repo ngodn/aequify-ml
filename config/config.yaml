@@ -6,7 +6,7 @@ trading:
     - - 2320
       - 2321
   risk:
-    max_positions: 1
+    max_positions: 20
   futures:
     margin_mode: CROSS
     leverage: 10
@@ -35,9 +35,6 @@ filters:
         - ETH
         - ADA
         - XRP
-        - PIEVERSE
-        - 0G
-        - OG
       whitelist: []
 engines:
   apex:
