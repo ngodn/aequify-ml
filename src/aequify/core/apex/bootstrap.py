@@ -700,3 +700,410 @@ async def bootstrap_symbol(
     """
     apex = APEX(symbol=symbol, config=config or DEFAULT_CONFIG)
     return await apex.bootstrap(timestamps, prices, quantities, sides)
+
+
+# =============================================================================
+# Override File Generation - Narrowed Bounds
+# =============================================================================
+
+
+def _calculate_narrowed_bounds(
+    param_combos: "NDArray[np.float64]",
+    entries: "NDArray[np.int32]",
+    winners: "NDArray[np.int32]",
+    pnls: "NDArray[np.float64]",
+    original_bounds: "ParameterBounds",
+    param_index: int,
+    min_entries: int = 10,
+    min_win_rate: float = 0.5,
+    min_avg_pnl: float = 0.0,
+    percentile_low: float = 10,
+    percentile_high: float = 90,
+) -> "ParameterBounds | None":
+    """
+    Calculate narrowed bounds for a parameter based on good-performing combinations.
+
+    Finds combinations with good win rate and PnL, then narrows the bounds
+    to the percentile range of those values.
+
+    Args:
+        param_combos: Array of parameter combinations (n_combos, 9).
+        entries: Array of entry counts.
+        winners: Array of winner counts.
+        pnls: Array of total PnL values.
+        original_bounds: Original bounds for this parameter.
+        param_index: Column index of parameter in param_combos.
+        min_entries: Minimum entries to consider valid.
+        min_win_rate: Minimum win rate threshold.
+        min_avg_pnl: Minimum average PnL threshold.
+        percentile_low: Lower percentile for range.
+        percentile_high: Upper percentile for range.
+
+    Returns:
+        Narrowed ParameterBounds or None if not enough good combinations.
+    """
+    if param_combos is None or entries is None or len(param_combos) == 0:
+        return None
+
+    # Find "good" combinations
+    good_values = []
+    best_value = None
+    best_loss = float("inf")
+
+    for i in range(len(param_combos)):
+        n_entries = entries[i]
+        if n_entries < min_entries:
+            continue
+
+        wr = winners[i] / n_entries
+        avg_pnl = pnls[i] / n_entries
+
+        # Check if this combo meets quality thresholds
+        if wr >= min_win_rate and avg_pnl >= min_avg_pnl:
+            good_values.append(param_combos[i, param_index])
+
+        # Track best for default (loss function: lower is better)
+        sample_bonus = min(n_entries / 50, 1.0) * 5
+        loss = (1 - wr) * 20 - avg_pnl * 8 - sample_bonus
+        if loss < best_loss:
+            best_loss = loss
+            best_value = param_combos[i, param_index]
+
+    if len(good_values) < 3:
+        # Not enough good combinations, return original bounds with best value as default
+        if best_value is not None:
+            return ParameterBounds(
+                min=original_bounds.min,
+                max=original_bounds.max,
+                step=original_bounds.step,
+                default=float(best_value),
+            )
+        return None
+
+    good_values_arr = np.array(good_values)
+
+    # Calculate percentile-based range
+    p_low = np.percentile(good_values_arr, percentile_low)
+    p_high = np.percentile(good_values_arr, percentile_high)
+
+    # Snap to step grid
+    step = original_bounds.step
+    new_min = np.floor(p_low / step) * step
+    new_max = np.ceil(p_high / step) * step
+
+    # Clamp to original bounds
+    new_min = max(new_min, original_bounds.min)
+    new_max = min(new_max, original_bounds.max)
+
+    # Ensure min < max
+    if new_min >= new_max:
+        new_min = original_bounds.min
+        new_max = original_bounds.max
+
+    return ParameterBounds(
+        min=float(new_min),
+        max=float(new_max),
+        step=step,
+        default=float(best_value) if best_value is not None else original_bounds.default,
+    )
+
+
+def analyze_results_for_bounds(
+    config: "APEXConfig",
+    result: BootstrapResult,
+    min_win_rate: float = 0.5,
+    min_avg_pnl: float = 0.0,
+) -> dict[str, "ParameterBounds"]:
+    """
+    Analyze optimization results to extract narrowed bounds for all parameters.
+
+    Param layout (9 params):
+    - [pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist]
+
+    Returns dict with keys like:
+    - long_price_move_pct, long_volume_imbalance_threshold, long_dca_distance_pct
+    - short_price_move_pct, short_volume_imbalance_threshold, short_dca_distance_pct
+    - target_profit_pct, stop_loss_pct
+    """
+    narrowed: dict[str, ParameterBounds] = {}
+
+    # Parameter indices in the grid
+    pm_idx, dt_idx, tp_idx, sl_idx, dca_dist_idx = 0, 2, 3, 4, 8
+
+    # LONG parameter bounds
+    if result.long_param_combos is not None and result.long_entries is not None:
+        # Price move
+        b = _calculate_narrowed_bounds(
+            result.long_param_combos, result.long_entries, result.long_winners,
+            result.long_pnls, config.long_price_move_bounds, pm_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["long_price_move_pct"] = b
+
+        # Delta threshold (volume imbalance)
+        b = _calculate_narrowed_bounds(
+            result.long_param_combos, result.long_entries, result.long_winners,
+            result.long_pnls, config.long_delta_threshold_bounds, dt_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["long_volume_imbalance_threshold"] = b
+
+        # DCA distance
+        b = _calculate_narrowed_bounds(
+            result.long_param_combos, result.long_entries, result.long_winners,
+            result.long_pnls, config.long_dca_distance_bounds, dca_dist_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["long_dca_distance_pct"] = b
+
+        # Target profit (from LONG)
+        b = _calculate_narrowed_bounds(
+            result.long_param_combos, result.long_entries, result.long_winners,
+            result.long_pnls, config.target_profit_bounds, tp_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["target_profit_pct"] = b
+
+        # Stop loss (from LONG)
+        b = _calculate_narrowed_bounds(
+            result.long_param_combos, result.long_entries, result.long_winners,
+            result.long_pnls, config.stop_loss_bounds, sl_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["stop_loss_pct"] = b
+
+    # SHORT parameter bounds
+    if result.short_param_combos is not None and result.short_entries is not None:
+        # Price move
+        b = _calculate_narrowed_bounds(
+            result.short_param_combos, result.short_entries, result.short_winners,
+            result.short_pnls, config.short_price_move_bounds, pm_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["short_price_move_pct"] = b
+
+        # Delta threshold (volume imbalance)
+        b = _calculate_narrowed_bounds(
+            result.short_param_combos, result.short_entries, result.short_winners,
+            result.short_pnls, config.short_delta_threshold_bounds, dt_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["short_volume_imbalance_threshold"] = b
+
+        # DCA distance
+        b = _calculate_narrowed_bounds(
+            result.short_param_combos, result.short_entries, result.short_winners,
+            result.short_pnls, config.short_dca_distance_bounds, dca_dist_idx,
+            min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+        )
+        if b:
+            narrowed["short_dca_distance_pct"] = b
+
+        # Position params from SHORT if not already set from LONG
+        if "target_profit_pct" not in narrowed:
+            b = _calculate_narrowed_bounds(
+                result.short_param_combos, result.short_entries, result.short_winners,
+                result.short_pnls, config.target_profit_bounds, tp_idx,
+                min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+            )
+            if b:
+                narrowed["target_profit_pct"] = b
+
+        if "stop_loss_pct" not in narrowed:
+            b = _calculate_narrowed_bounds(
+                result.short_param_combos, result.short_entries, result.short_winners,
+                result.short_pnls, config.stop_loss_bounds, sl_idx,
+                min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
+            )
+            if b:
+                narrowed["stop_loss_pct"] = b
+
+    return narrowed
+
+
+def _bounds_to_dict(b: "ParameterBounds") -> dict:
+    """Convert ParameterBounds to dict for YAML."""
+    return {
+        "min": round(b.min, 4),
+        "max": round(b.max, 4),
+        "step": round(b.step, 4),
+        "default": round(b.default, 4),
+    }
+
+
+def generate_override_yaml(
+    symbol: str,
+    config: "APEXConfig",
+    result: BootstrapResult,
+    trade_count: int = 0,
+    min_win_rate: float = 0.5,
+    min_avg_pnl: float = 0.0,
+) -> str | None:
+    """
+    Generate per-symbol override YAML content with narrowed bounds.
+
+    Analyzes bootstrap results to find parameter ranges that performed well,
+    then generates YAML with narrowed bounds for future searches.
+
+    Args:
+        symbol: Trading pair symbol (e.g., "BTC/USDT:USDT").
+        config: APEXConfig used for the bootstrap.
+        result: BootstrapResult with raw param arrays.
+        trade_count: Number of trades analyzed (for documentation).
+        min_win_rate: Minimum win rate for "good" combinations.
+        min_avg_pnl: Minimum avg PnL for "good" combinations.
+
+    Returns:
+        YAML string or None if no valid results.
+    """
+    import yaml
+    from datetime import datetime
+
+    # Analyze results to get narrowed bounds
+    narrowed = analyze_results_for_bounds(config, result, min_win_rate, min_avg_pnl)
+
+    if not narrowed:
+        return None
+
+    # Build header comment
+    long_wr = f"{result.long.win_rate * 100:.1f}%" if result.long else "N/A"
+    short_wr = f"{result.short.win_rate * 100:.1f}%" if result.short else "N/A"
+
+    header = f"""# Auto-generated by APEX bootstrap
+# Symbol: {symbol}
+# Trades analyzed: {trade_count:,}
+# Win rates: LONG={long_wr}, SHORT={short_wr}
+# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+"""
+
+    # Build override structure with narrowed bounds
+    override: dict = {
+        "engines": {
+            "apex": {
+                "bootstrap": {
+                    "long": {},
+                    "short": {},
+                    "position": {},
+                }
+            }
+        }
+    }
+    bootstrap = override["engines"]["apex"]["bootstrap"]
+
+    # Map narrowed bounds to YAML structure
+    for key, bounds in narrowed.items():
+        if key.startswith("long_"):
+            param_name = key[5:]  # Remove "long_" prefix
+            bootstrap["long"][param_name] = _bounds_to_dict(bounds)
+        elif key.startswith("short_"):
+            param_name = key[6:]  # Remove "short_" prefix
+            bootstrap["short"][param_name] = _bounds_to_dict(bounds)
+        else:
+            # Position params (target_profit_pct, stop_loss_pct)
+            bootstrap["position"][key] = _bounds_to_dict(bounds)
+
+    # Clean up empty sections
+    if not bootstrap["long"]:
+        del bootstrap["long"]
+    if not bootstrap["short"]:
+        del bootstrap["short"]
+    if not bootstrap["position"]:
+        del bootstrap["position"]
+
+    # Check if we have any meaningful overrides
+    if not bootstrap:
+        return None
+
+    return header + yaml.dump(override, default_flow_style=False, sort_keys=False)
+
+
+def write_override_file(
+    symbol: str,
+    content: str,
+    overrides_dir: str,
+) -> str:
+    """
+    Write override YAML content to file.
+
+    Args:
+        symbol: Trading pair symbol (e.g., "BTC/USDT:USDT").
+        content: YAML content to write.
+        overrides_dir: Directory for override files.
+
+    Returns:
+        Path to written file.
+    """
+    import os
+
+    # Normalize symbol: "BTC/USDT:USDT" -> "BTCUSDT"
+    symbol_normalized = symbol.replace("/", "").replace(":", "")
+    # Ensure single USDT suffix
+    if symbol_normalized.endswith("USDTUSDT"):
+        symbol_normalized = symbol_normalized[:-4]
+
+    filepath = os.path.join(overrides_dir, f"{symbol_normalized}.yaml")
+
+    os.makedirs(overrides_dir, exist_ok=True)
+    with open(filepath, "w") as f:
+        f.write(content)
+
+    return filepath
+
+
+def generate_override_for_symbol(
+    symbol: str,
+    config: "APEXConfig",
+    result: BootstrapResult,
+    overrides_dir: str,
+    trade_count: int = 0,
+    overwrite: bool = False,
+) -> str | None:
+    """
+    Generate and write override file for a symbol with narrowed bounds.
+
+    High-level convenience function that analyzes bootstrap results,
+    generates narrowed bounds YAML, and writes to file.
+
+    Args:
+        symbol: Trading pair symbol.
+        config: APEXConfig used for the bootstrap.
+        result: BootstrapResult from bootstrap.
+        overrides_dir: Directory for override files.
+        trade_count: Number of trades analyzed.
+        overwrite: Whether to overwrite existing file.
+
+    Returns:
+        Path to written file, or None if skipped/failed.
+    """
+    import os
+
+    # Normalize symbol for filename check
+    symbol_normalized = symbol.replace("/", "").replace(":", "")
+    if symbol_normalized.endswith("USDTUSDT"):
+        symbol_normalized = symbol_normalized[:-4]
+
+    filepath = os.path.join(overrides_dir, f"{symbol_normalized}.yaml")
+
+    # Skip if file exists and overwrite is False
+    if os.path.exists(filepath) and not overwrite:
+        logger.debug(f"[{symbol}] Override file already exists, skipping: {filepath}")
+        return None
+
+    # Generate YAML content with narrowed bounds
+    content = generate_override_yaml(symbol, config, result, trade_count)
+    if not content:
+        logger.debug(f"[{symbol}] No valid results for override generation")
+        return None
+
+    # Write file
+    written_path = write_override_file(symbol, content, overrides_dir)
+    logger.info(f"[{symbol}] Generated override file: {written_path}")
+    return written_path

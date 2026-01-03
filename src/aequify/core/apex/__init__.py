@@ -10,8 +10,11 @@ from aequify.core.apex.bootstrap import (
     BootstrapResult,
     DirectionResult,
     bootstrap_symbol,
+    generate_override_for_symbol,
+    generate_override_yaml,
     get_gpu_info,
     is_gpu_available,
+    write_override_file,
 )
 from aequify.core.apex.config import (
     APEXConfig,
@@ -44,6 +47,10 @@ __all__ = [
     "bootstrap_symbol",
     "is_gpu_available",
     "get_gpu_info",
+    # Override Generation
+    "generate_override_yaml",
+    "generate_override_for_symbol",
+    "write_override_file",
     # Config
     "APEXConfig",
     "DEFAULT_CONFIG",
