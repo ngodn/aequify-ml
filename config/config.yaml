@@ -6,7 +6,7 @@ trading:
     - - 2320
       - 2321
   risk:
-    max_positions: 20
+    max_positions: 1
   futures:
     margin_mode: CROSS
     leverage: 10
@@ -24,7 +24,7 @@ filters:
   - name: absolute_price_percentage_change
     enabled: true
     config:
-      top: 2
+      top: 60
   - name: symbol_filter
     enabled: true
     config:
@@ -35,25 +35,28 @@ filters:
         - ETH
         - ADA
         - XRP
+        - PIEVERSE
+        - 0G
+        - OG
       whitelist: []
 engines:
   apex:
     bootstrap:
-      min_lookback_days: 1.0
+      min_lookback_days: 7.0
       trades_lookback_days: 90.0
-      max_trades: 5000000
+      max_trades: 25000000
       max_cache_valid_days: 15.0
       rolling_kernel:
         lookback_windows_ms:
+          - 300000
           - 900000
-          - 14400000
-      volume_imbalance_kernel:
-        price_tolerance_pct: 2.5
+          - 3600000
+          # - 14400000
       position:
         target_profit_pct:
           min: 1.75
           max: 5.75
-          step: 2.0
+          step: 1.0
           default: 1.5
         stop_loss_pct:
           min: -3.0
@@ -68,36 +71,36 @@ engines:
       long:
         signal_offset: 0.25
         price_move_pct:
-          min: -7.75
+          min: -10.75
           max: -1.75
           step: 1.0
           default: -3.5
-        volume_imbalance_threshold:
+        volume_delta_threshold:
           min: -90
           max: -70
           step: 10
-          default: -50
+          default: -85
         dca_distance_pct:
-          min: -9.75
-          max: -3.75
+          min: -10.75
+          max: -1.75
           step: 2.0
-          default: -3.5
+          default: -5.5
       short:
         signal_offset: 0.25
         price_move_pct:
           min: 5.0
           max: 20.0
           step: 5.0
-          default: 7.0
-        volume_imbalance_threshold:
+          default: 10.0
+        volume_delta_threshold:
           min: 70
           max: 90
           step: 10
-          default: 50
+          default: 85
         dca_distance_pct:
-          min: 10.0
-          max: 40.0
-          step: 10.0
+          min: 5.0
+          max: 20.0
+          step: 5.0
           default: 7.0
     live:
       lookback_windows_ms: 14400000
