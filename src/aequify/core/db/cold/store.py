@@ -351,7 +351,12 @@ class ColdStore:
         """
         row = await self._client.query_one(sql, symbol)
         if row and row.get("min_ts") is not None and row.get("max_ts") is not None:
-            return (int(row["min_ts"]), int(row["max_ts"]))
+            # Convert datetime to milliseconds
+            min_ts = row["min_ts"]
+            max_ts = row["max_ts"]
+            min_ms = int(min_ts.timestamp() * 1000) if hasattr(min_ts, "timestamp") else int(min_ts)
+            max_ms = int(max_ts.timestamp() * 1000) if hasattr(max_ts, "timestamp") else int(max_ts)
+            return (min_ms, max_ms)
         return None
 
     async def trade_exists(self, symbol: str, trade_id: int) -> bool:
