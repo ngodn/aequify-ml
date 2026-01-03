@@ -822,14 +822,25 @@ class Aequify(App):
         try:
             from aequify.tui.widgets.symbols.apex_chart_pane import APEXTUIState, OptimizedParams
 
+            state_data = message.data.get("state", {})
+
+            # Update symbol browser init_stage (for all symbols, not just selected)
+            init_stage = state_data.get("init_stage", "")
+            if init_stage:
+                # Only show "backfilling" and "bootstrapping" in browser, others clear status
+                browser_stage = init_stage if init_stage in ("backfilling", "bootstrapping") else ""
+                try:
+                    symbol_browser = self.query_one("#symbol-browser", SymbolBrowser)
+                    symbol_browser.update_symbol_init_stage(message.symbol, browser_stage)
+                except Exception:
+                    pass  # Browser may not exist yet
+
             selected_area = self.query_one("#selected-symbol-area", SelectedSymbolArea)
             apex_pane = selected_area.apex_chart_pane
 
-            # Only update if this symbol is currently selected
+            # Only update APEX pane if this symbol is currently selected
             if apex_pane._selected_symbol != message.symbol:
                 return
-
-            state_data = message.data.get("state", {})
             if not state_data:
                 return
 

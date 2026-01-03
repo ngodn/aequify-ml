@@ -42,6 +42,7 @@ class SymbolData:
         has_long: Whether symbol has an active long position.
         has_short: Whether symbol has an active short position.
         position_pnl: Unrealized PnL percentage if active.
+        init_stage: Initialization stage ("backfilling", "bootstrapping", or empty).
     """
 
     symbol: str
@@ -52,6 +53,7 @@ class SymbolData:
     has_long: bool = False
     has_short: bool = False
     position_pnl: float = 0.0
+    init_stage: str = ""  # "backfilling", "bootstrapping", or empty when done
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -218,6 +220,12 @@ Shows filtered trading symbols from the filter pipeline.
             pct_text = " 0.0%"
             parts.append((pct_text, muted))
 
+        # Init stage (backfilling/bootstrapping) in italic
+        if symbol_data.init_stage == "backfilling":
+            parts.append((" (backfilling...)", f"italic {muted}"))
+        elif symbol_data.init_stage == "bootstrapping":
+            parts.append((" (bootstrapping...)", f"italic {muted}"))
+
         # Position PnL if active (use accent/secondary to differentiate from 24H% colors)
         if symbol_data.has_position and symbol_data.position_pnl != 0:
             pnl = symbol_data.position_pnl
@@ -360,6 +368,13 @@ Shows filtered trading symbols from the filter pipeline.
             symbol_data.position_pnl = 0.0
         self._clear_line_cache()
         self.refresh()
+
+    def update_symbol_init_stage(self, symbol: str, init_stage: str) -> None:
+        """Update init stage for a specific symbol (backfilling, bootstrapping, or empty)."""
+        if symbol in self._symbols:
+            self._symbols[symbol].init_stage = init_stage
+            self._clear_line_cache()
+            self.refresh()
 
     @property
     def symbol_count(self) -> int:
@@ -520,6 +535,10 @@ class SymbolBrowser(Vertical):
     def clear_all_positions(self) -> None:
         """Clear position flags from all symbols."""
         self.symbol_tree.clear_all_positions()
+
+    def update_symbol_init_stage(self, symbol: str, init_stage: str) -> None:
+        """Update init stage for a specific symbol (backfilling, bootstrapping, or empty)."""
+        self.symbol_tree.update_symbol_init_stage(symbol, init_stage)
 
     @property
     def symbol_tree(self) -> SymbolTree:
