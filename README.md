@@ -75,6 +75,10 @@ Run `mise run` to see all available tasks.
 
 **GPU:** NVIDIA GPUs supported and tested. AMD may work but untested. APEX bootstrap requires GPU for grid search acceleration.
 
+## Community
+
+Join the Discord: https://discord.gg/RcMGpasGC7
+
 ## Contributing
 
 Not accepting PRs at this time. Issues and feature requests welcome.
