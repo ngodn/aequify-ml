@@ -70,7 +70,7 @@ engines:
         price_move_pct:
           min: -10.75
           max: -1.75
-          step: 1.0
+          step: 2.0
           default: -3.5
         volume_delta_threshold:
           min: -90
@@ -80,7 +80,7 @@ engines:
         dca_distance_pct:
           min: -10.75
           max: -1.75
-          step: 2.0
+          step: 4.0
           default: -5.5
       short:
         signal_offset: 0.25
