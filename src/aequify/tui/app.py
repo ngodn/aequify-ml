@@ -876,15 +876,25 @@ class Aequify(App):
             current_is_bootstrapped = current_state.is_bootstrapped if current_state else False
             is_bootstrapped = state_data.get("is_bootstrapped", current_is_bootstrapped)
 
+            # Preserve init_stage if not provided (partial updates)
+            current_init_stage = current_state.init_stage if current_state else "none"
+
             tui_state = APEXTUIState(
                 is_bootstrapped=is_bootstrapped,
                 source=state_data.get("source", ""),
+                # Initialization stage tracking
+                init_stage=state_data.get("init_stage", current_init_stage),
+                init_queue_position=state_data.get("init_queue_position", 0),
+                init_queue_total=state_data.get("init_queue_total", 0),
+                # Params
                 long_params=long_params,
                 short_params=short_params,
+                # Backfill progress
                 backfill_status=state_data.get("backfill_status", ""),
                 backfill_progress=state_data.get("backfill_progress", 0.0),
                 backfill_current_day=state_data.get("backfill_current_day", 0),
                 backfill_total_days=state_data.get("backfill_total_days", 0),
+                # Live data
                 current_price=state_data.get("current_price", 0.0),
                 trade_count=state_data.get("trade_count", 0),
             )
@@ -958,11 +968,12 @@ class Aequify(App):
                 rolling_low=metrics.get("rolling_low", current_state.rolling_low),
                 price_move_from_high=metrics.get("price_move_from_high", current_state.price_move_from_high),
                 price_move_from_low=metrics.get("price_move_from_low", current_state.price_move_from_low),
-                price_window=metrics.get("price_window", current_state.price_window),
-                # Volume delta
+                # Time windows from bootstrap (per direction)
+                long_time_window=metrics.get("long_time_window", current_state.long_time_window),
+                short_time_window=metrics.get("short_time_window", current_state.short_time_window),
+                # Volume delta (per direction, using same window as rolling extreme)
                 long_volume_delta=metrics.get("long_volume_delta", current_state.long_volume_delta),
                 short_volume_delta=metrics.get("short_volume_delta", current_state.short_volume_delta),
-                imbalance_price_pct=metrics.get("imbalance_price_pct", current_state.imbalance_price_pct),
                 # Signal state
                 long_signal_ready=metrics.get("long_signal_ready", current_state.long_signal_ready),
                 short_signal_ready=metrics.get("short_signal_ready", current_state.short_signal_ready),

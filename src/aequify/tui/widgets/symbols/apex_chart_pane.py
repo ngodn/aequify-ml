@@ -69,6 +69,12 @@ class APEXTUIState:
     is_bootstrapped: bool = False
     source: str = "none"  # "gpu", "cached", "none"
 
+    # Initialization stage for waiting state display
+    # Values: "none", "queued", "checking_cache", "backfilling", "bootstrapping", "complete"
+    init_stage: str = "none"
+    init_queue_position: int = 0  # Position in initialization queue (1-based)
+    init_queue_total: int = 0  # Total symbols in queue
+
     # Optimized parameters (from bootstrap)
     long_params: OptimizedParams | None = None
     short_params: OptimizedParams | None = None
@@ -99,9 +105,9 @@ class APEXTUIState:
     long_signal_ready: bool = False
     short_signal_ready: bool = False
 
-    # Config bounds (for reference display)
-    price_window: int = 3000  # ms
-    imbalance_price_pct: float = 1.0  # % price tolerance for imbalance calc
+    # Time windows from bootstrap (per direction)
+    long_time_window: int = 0  # ms - from LONG bootstrap result
+    short_time_window: int = 0  # ms - from SHORT bootstrap result
 
     # Signal entry offset (triggers slightly before threshold)
     long_signal_offset: float = 0.0  # LONG triggers at (threshold + offset)
@@ -362,11 +368,33 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
         muted = colors["muted"]
 
         if not state.is_bootstrapped:
-            # Check if backfill is in progress
-            if state.backfill_status:
-                content = Text()
-                content.append("Backfilling historical data...\n\n", style=f"bold {warning}")
-                content.append(f"  {state.backfill_status}\n\n", style=accent)
+            content = Text()
+
+            # Show different messages based on initialization stage
+            stage = state.init_stage
+
+            if stage == "queued":
+                # Waiting in queue
+                content.append("⏳ Queued for initialization\n\n", style=f"bold {warning}")
+                if state.init_queue_position > 0 and state.init_queue_total > 0:
+                    content.append(
+                        f"  Position {state.init_queue_position} of {state.init_queue_total} symbols\n",
+                        style=accent,
+                    )
+                content.append("\n  Symbols initialize sequentially to manage resources.", style=muted)
+                return Panel(content, title="Bootstrap Parameters", border_style=warning)
+
+            elif stage == "checking_cache":
+                # Checking cold store for cached results
+                content.append("🔍 Checking cached parameters...\n\n", style=f"bold {accent}")
+                content.append("  Looking for valid bootstrap results in cold storage.", style=muted)
+                return Panel(content, title="Bootstrap Parameters", border_style=accent)
+
+            elif stage == "backfilling" or state.backfill_status:
+                # Backfill in progress
+                content.append("📥 Importing historical data...\n\n", style=f"bold {warning}")
+                if state.backfill_status:
+                    content.append(f"  {state.backfill_status}\n\n", style=accent)
 
                 # Progress bar
                 progress_width = 40
@@ -379,13 +407,20 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
                     f" {state.backfill_progress}% ({state.backfill_current_day}/{state.backfill_total_days} days)\n",
                     style=muted,
                 )
-
                 return Panel(content, title="Bootstrap Parameters", border_style=warning)
 
-            not_ready = Text(
-                "APEX not bootstrapped - waiting for initialization...", style=f"{muted} italic"
-            )
-            return Panel(not_ready, title="Bootstrap Parameters", border_style=muted)
+            elif stage == "bootstrapping":
+                # GPU optimization running
+                content.append("⚡ Running GPU optimization...\n\n", style=f"bold {secondary}")
+                content.append("  Grid search across parameter combinations.\n", style=muted)
+                content.append("  This may take a few seconds.", style=muted)
+                return Panel(content, title="Bootstrap Parameters", border_style=secondary)
+
+            else:
+                # Default: none or unknown stage
+                content.append("○ Waiting for initialization...\n\n", style=f"{muted} italic")
+                content.append("  Select this symbol to begin bootstrap process.", style=muted)
+                return Panel(content, title="Bootstrap Parameters", border_style=muted)
 
         # Create side-by-side table for LONG and SHORT
         table = Table.grid(padding=(0, 2))
@@ -1039,12 +1074,14 @@ class APEXChartPane(VerticalScroll, ThemeColorsMixin):
 
         table.add_row(long_text, short_text)
 
-        # Window info
+        # Window info (time windows from bootstrap per direction)
         window_text = Text()
         window_text.append("\n")
-        window_text.append(f"Price window: {state.price_window}ms", style=muted)
+        long_tw_str = f"{state.long_time_window // 1000}s" if state.long_time_window < 60000 else f"{state.long_time_window // 60000}m"
+        short_tw_str = f"{state.short_time_window // 1000}s" if state.short_time_window < 60000 else f"{state.short_time_window // 60000}m"
+        window_text.append(f"LONG window: {long_tw_str}", style=muted)
         window_text.append("  │  ", style=muted)
-        window_text.append(f"Imbalance tolerance: {state.imbalance_price_pct:.1f}%", style=muted)
+        window_text.append(f"SHORT window: {short_tw_str}", style=muted)
 
         # Determine border style based on any conditions met
         long_conds = sum([long_delta_ok, long_pm_ok])
