@@ -8,9 +8,9 @@ Architecture:
     APEX (one per symbol)
         └─ IsolatedLoop (optional, for non-blocking bootstrap)
             └─ Mojo GPU Kernels
-                ├─ volume_imbalance
+                ├─ volume_delta_multi (buy-sell imbalance over same windows as rolling)
                 ├─ rolling_high / rolling_low
-                └─ grid_search_long / grid_search_short
+                └─ grid_search_long_dca / grid_search_short_dca
 
 Usage:
     from aequify.core.apex import APEX, APEXConfig
@@ -167,7 +167,7 @@ class DirectionResult:
             params=VADParameters(
                 price_move=cold_result.price_move,
                 time_window=cold_result.time_window,
-                delta_threshold=cold_result.imbalance_threshold,
+                delta_threshold=cold_result.volume_delta_threshold,
                 target_profit=cold_result.take_profit,
                 stop_loss=cold_result.stop_loss,
                 max_hold_time=cold_result.max_hold_time,
@@ -198,7 +198,7 @@ class DirectionResult:
             direction=Direction(self.direction.lower()),
             price_move=self.params.price_move,
             min_dca_distance=self.params.dca_distance_pct,
-            imbalance_threshold=self.params.delta_threshold,
+            volume_delta_threshold=self.params.delta_threshold,
             time_window=self.params.time_window,
             take_profit=self.params.target_profit,
             stop_loss=self.params.stop_loss,
@@ -347,7 +347,6 @@ class APEX:
                 "time_windows_ms": time_windows_ms,
                 "long_param_grid": long_param_grid,
                 "short_param_grid": short_param_grid,
-                "imbalance_price_tolerance_pct": self.config.imbalance_price_tolerance_pct,
                 "max_scan": max_scan,
                 "outer_stride": outer_stride,
                 "min_entries": self.config.min_entries_for_validity,
@@ -817,18 +816,18 @@ def analyze_results_for_bounds(
     """
     Analyze optimization results to extract narrowed bounds for all parameters.
 
-    Param layout (9 params):
-    - [pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist]
+    Param layout (7 params):
+    - [pm, w_idx, dt, tp, sl, mh, dca_dist]
 
     Returns dict with keys like:
-    - long_price_move_pct, long_volume_imbalance_threshold, long_dca_distance_pct
-    - short_price_move_pct, short_volume_imbalance_threshold, short_dca_distance_pct
+    - long_price_move_pct, long_volume_delta_threshold, long_dca_distance_pct
+    - short_price_move_pct, short_volume_delta_threshold, short_dca_distance_pct
     - target_profit_pct, stop_loss_pct
     """
     narrowed: dict[str, ParameterBounds] = {}
 
-    # Parameter indices in the grid
-    pm_idx, dt_idx, tp_idx, sl_idx, dca_dist_idx = 0, 2, 3, 4, 8
+    # Parameter indices in the grid (7 params)
+    pm_idx, dt_idx, tp_idx, sl_idx, dca_dist_idx = 0, 2, 3, 4, 6
 
     # LONG parameter bounds
     if result.long_param_combos is not None and result.long_entries is not None:
@@ -841,14 +840,14 @@ def analyze_results_for_bounds(
         if b:
             narrowed["long_price_move_pct"] = b
 
-        # Delta threshold (volume imbalance)
+        # Delta threshold (volume delta)
         b = _calculate_narrowed_bounds(
             result.long_param_combos, result.long_entries, result.long_winners,
             result.long_pnls, config.long_delta_threshold_bounds, dt_idx,
             min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
         )
         if b:
-            narrowed["long_volume_imbalance_threshold"] = b
+            narrowed["long_volume_delta_threshold"] = b
 
         # DCA distance
         b = _calculate_narrowed_bounds(
@@ -888,14 +887,14 @@ def analyze_results_for_bounds(
         if b:
             narrowed["short_price_move_pct"] = b
 
-        # Delta threshold (volume imbalance)
+        # Delta threshold (volume delta)
         b = _calculate_narrowed_bounds(
             result.short_param_combos, result.short_entries, result.short_winners,
             result.short_pnls, config.short_delta_threshold_bounds, dt_idx,
             min_win_rate=min_win_rate, min_avg_pnl=min_avg_pnl,
         )
         if b:
-            narrowed["short_volume_imbalance_threshold"] = b
+            narrowed["short_volume_delta_threshold"] = b
 
         # DCA distance
         b = _calculate_narrowed_bounds(

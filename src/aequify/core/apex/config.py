@@ -165,9 +165,7 @@ class APEXConfig:
         max_warm_age_hours: Maximum age of warm data to be considered valid
         max_cache_valid_days: If cache is younger than this, skip backfill entirely
         bootstrap: Bootstrap optimization configuration
-        continuous_learning: Continuous learning configuration
         min_entries_for_validity: Minimum entries for statistical significance
-        imbalance_price_tolerance_pct: Price tolerance % for volume imbalance calculation
     """
 
     # Data validation
@@ -182,10 +180,6 @@ class APEXConfig:
 
     # Validity
     min_entries_for_validity: int = 5
-
-    # Volume imbalance price tolerance (footprint/order flow style)
-    # Measures buy/sell imbalance at trades within X% of current price
-    imbalance_price_tolerance_pct: float = 1.0  # 1% price range
 
     # Position simulation
     position: PositionParameters = field(default_factory=PositionParameters)
@@ -326,15 +320,13 @@ class APEXConfig:
         LONG: price drops (negative pm) + selling pressure (negative dt)
 
         Returns:
-            List of [pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist] combinations
+            List of [pm, w_idx, dt, tp, sl, mh, dca_dist] combinations (7 params)
             - pm: price_move threshold (negative)
             - w_idx: time window index
-            - dt: delta_threshold (negative)
+            - dt: volume_delta_threshold (negative = selling pressure)
             - tp: target_profit %
             - sl: stop_loss %
             - mh: max_hold_time_ms
-            - dca_mult: DCA multiplier (4.25)
-            - max_pos_mult: max_position / initial_position ratio
             - dca_dist: DCA distance % (negative for LONG)
         """
         pms = self.long_price_move_bounds.grid_values()
@@ -344,10 +336,6 @@ class APEXConfig:
         mhs = self.max_hold_time_bounds.grid_values()
         dcas = self.long_dca_distance_bounds.grid_values()
 
-        # Position sizing multipliers (fixed)
-        dca_mult = self.dca_multiplier
-        max_pos_mult = self.max_position_usdt / self.initial_position_usdt
-
         combos = []
         for pm in pms:
             for w_idx in range(len(self.time_windows_ms)):
@@ -356,7 +344,7 @@ class APEXConfig:
                         for sl in sls:
                             for mh in mhs:
                                 for dca_dist in dcas:
-                                    combos.append([pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist])
+                                    combos.append([pm, w_idx, dt, tp, sl, mh, dca_dist])
 
         return combos
 
@@ -367,15 +355,13 @@ class APEXConfig:
         SHORT: price rises (positive pm) + buying pressure (positive dt)
 
         Returns:
-            List of [pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist] combinations
+            List of [pm, w_idx, dt, tp, sl, mh, dca_dist] combinations (7 params)
             - pm: price_move threshold (positive)
             - w_idx: time window index
-            - dt: delta_threshold (positive)
+            - dt: volume_delta_threshold (positive = buying pressure)
             - tp: target_profit %
             - sl: stop_loss %
             - mh: max_hold_time_ms
-            - dca_mult: DCA multiplier (4.25)
-            - max_pos_mult: max_position / initial_position ratio
             - dca_dist: DCA distance % (positive for SHORT)
         """
         pms = self.short_price_move_bounds.grid_values()
@@ -385,10 +371,6 @@ class APEXConfig:
         mhs = self.max_hold_time_bounds.grid_values()
         dcas = self.short_dca_distance_bounds.grid_values()
 
-        # Position sizing multipliers (fixed)
-        dca_mult = self.dca_multiplier
-        max_pos_mult = self.max_position_usdt / self.initial_position_usdt
-
         combos = []
         for pm in pms:
             for w_idx in range(len(self.time_windows_ms)):
@@ -397,7 +379,7 @@ class APEXConfig:
                         for sl in sls:
                             for mh in mhs:
                                 for dca_dist in dcas:
-                                    combos.append([pm, w_idx, dt, tp, sl, mh, dca_mult, max_pos_mult, dca_dist])
+                                    combos.append([pm, w_idx, dt, tp, sl, mh, dca_dist])
 
         return combos
 
@@ -485,7 +467,7 @@ class APEXConfig:
             ParameterBounds(min=-7.75, max=-1.75, default=-3.5, step=1.0),
         )
         long_delta_threshold_bounds = parse_bounds(
-            long_data.get("volume_imbalance_threshold", {}),
+            long_data.get("volume_delta_threshold", {}),
             ParameterBounds(min=-90, max=-70, default=-50, step=10),
         )
 
@@ -496,7 +478,7 @@ class APEXConfig:
             ParameterBounds(min=5.0, max=20.0, default=7.0, step=5.0),
         )
         short_delta_threshold_bounds = parse_bounds(
-            short_data.get("volume_imbalance_threshold", {}),
+            short_data.get("volume_delta_threshold", {}),
             ParameterBounds(min=70, max=90, default=50, step=10),
         )
 
@@ -531,12 +513,6 @@ class APEXConfig:
             "lookback_windows_ms", [900000, 14400000]
         )
 
-        # Volume imbalance price tolerance from bootstrap.volume_imbalance_kernel
-        volume_imbalance_data = bootstrap_data.get("volume_imbalance_kernel", {})
-        imbalance_price_tolerance_pct = volume_imbalance_data.get(
-            "price_tolerance_pct", 2.5
-        )
-
         # Bootstrap config
         bootstrap = BootstrapConfig.from_dict(bootstrap_data)
 
@@ -546,7 +522,6 @@ class APEXConfig:
             max_cache_valid_days=data.get("max_cache_valid_days", 7.0),
             bootstrap=bootstrap,
             min_entries_for_validity=data.get("min_entries_for_validity", 5),
-            imbalance_price_tolerance_pct=imbalance_price_tolerance_pct,
             position=position,
             long_price_move_bounds=long_price_move_bounds,
             long_delta_threshold_bounds=long_delta_threshold_bounds,

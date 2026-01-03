@@ -128,7 +128,7 @@ class BootstrapResult:
         direction: Trading direction (long/short).
         price_move: Price move threshold (%).
         min_dca_distance: Minimum DCA distance (%).
-        imbalance_threshold: Volume imbalance threshold (%).
+        volume_delta_threshold: Volume delta threshold (%).
         time_window: Lookback time window (ms).
         take_profit: Take profit target (%).
         stop_loss: Stop loss threshold (%).
@@ -145,7 +145,7 @@ class BootstrapResult:
     direction: Direction
     price_move: float
     min_dca_distance: float
-    imbalance_threshold: float
+    volume_delta_threshold: float
     time_window: int
     take_profit: float
     stop_loss: float
@@ -167,7 +167,7 @@ class BootstrapResult:
         return {
             "price_move": self.price_move,
             "min_dca_distance": self.min_dca_distance,
-            "imbalance_threshold": self.imbalance_threshold,
+            "volume_delta_threshold": self.volume_delta_threshold,
             "time_window": self.time_window,
             "take_profit": self.take_profit,
             "stop_loss": self.stop_loss,
@@ -191,7 +191,7 @@ class BootstrapResult:
             direction=direction,
             price_move=float(data["price_move"]),
             min_dca_distance=float(data["min_dca_distance"]),
-            imbalance_threshold=float(data["imbalance_threshold"]),
+            volume_delta_threshold=float(data["volume_delta_threshold"]),
             time_window=int(data["time_window"]),
             take_profit=float(data["take_profit"]),
             stop_loss=float(data["stop_loss"]),
@@ -222,7 +222,7 @@ class BootstrapBounds:
         direction: Trading direction (long/short).
         optimized_bound_price_move: Optimized price move range (min, max).
         optimized_bound_min_dca_distance: Optimized DCA distance range.
-        optimized_bound_imbalance_threshold: Optimized imbalance range.
+        optimized_bound_volume_delta_threshold: Optimized volume delta range.
         optimized_bound_take_profit: Optimized take profit range.
         optimized_bound_stop_loss: Optimized stop loss range.
         optimized_bound_max_hold_time: Optimized max hold time range.
@@ -233,7 +233,7 @@ class BootstrapBounds:
     direction: Direction
     optimized_bound_price_move: tuple[float, float]
     optimized_bound_min_dca_distance: tuple[float, float]
-    optimized_bound_imbalance_threshold: tuple[float, float]
+    optimized_bound_volume_delta_threshold: tuple[float, float]
     optimized_bound_take_profit: tuple[float, float]
     optimized_bound_stop_loss: tuple[float, float]
     optimized_bound_max_hold_time: tuple[int, int]
@@ -251,8 +251,8 @@ class BootstrapBounds:
             "price_move_max": self.optimized_bound_price_move[1],
             "min_dca_distance_min": self.optimized_bound_min_dca_distance[0],
             "min_dca_distance_max": self.optimized_bound_min_dca_distance[1],
-            "imbalance_threshold_min": self.optimized_bound_imbalance_threshold[0],
-            "imbalance_threshold_max": self.optimized_bound_imbalance_threshold[1],
+            "volume_delta_threshold_min": self.optimized_bound_volume_delta_threshold[0],
+            "volume_delta_threshold_max": self.optimized_bound_volume_delta_threshold[1],
             "take_profit_min": self.optimized_bound_take_profit[0],
             "take_profit_max": self.optimized_bound_take_profit[1],
             "stop_loss_min": self.optimized_bound_stop_loss[0],
@@ -279,9 +279,9 @@ class BootstrapBounds:
                 float(data["min_dca_distance_min"]),
                 float(data["min_dca_distance_max"]),
             ),
-            optimized_bound_imbalance_threshold=(
-                float(data["imbalance_threshold_min"]),
-                float(data["imbalance_threshold_max"]),
+            optimized_bound_volume_delta_threshold=(
+                float(data["volume_delta_threshold_min"]),
+                float(data["volume_delta_threshold_max"]),
             ),
             optimized_bound_take_profit=(
                 float(data["take_profit_min"]),
